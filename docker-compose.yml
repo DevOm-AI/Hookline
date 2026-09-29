@@ -45,6 +45,10 @@ services:
   worker:
     <<: *app
     command: celery -A app.workers.celery_app:celery_app worker --loglevel=info
+    # docker stop sends SIGTERM: Celery finishes the requests in flight and takes no new ones.
+    # The default 10s before SIGKILL can cut a send short (connect, write and read each get
+    # 10s). Wait as long as the delivery lock; past that the sweeper hands it on anyway.
+    stop_grace_period: 60s
 
   # Run exactly one beat, or scheduled jobs fire twice.
   beat:
