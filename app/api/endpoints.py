@@ -124,6 +124,10 @@ def get_endpoint(endpoint_id: uuid.UUID, db: DbSession) -> EndpointOut:
 def update_endpoint(endpoint_id: uuid.UUID, body: EndpointUpdate, db: DbSession) -> EndpointOut:
     endpoint = _get_or_404(db, endpoint_id)
     endpoint.is_active = body.is_active
+    if body.is_active:
+        # A fresh start: otherwise the old failing streak would pause it again within a minute.
+        endpoint.failing_since = None
+        endpoint.auto_paused_at = None
     db.commit()
     return EndpointOut.model_validate(endpoint)
 

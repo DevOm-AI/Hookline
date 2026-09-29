@@ -20,10 +20,13 @@ let deadWanted = DEAD_PAGE_SIZE;
 
 class Unauthorized extends Error {}
 
-async function request(method, path) {
+async function request(method, path, json) {
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  if (json !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(path, {
     method,
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers,
+    body: json === undefined ? undefined : JSON.stringify(json),
   });
   if (response.status === 401) throw new Unauthorized();
   const body = await response.json().catch(() => null);
@@ -34,8 +37,8 @@ async function request(method, path) {
   return { body, headers: response.headers };
 }
 
-async function api(method, path) {
-  return (await request(method, path)).body;
+async function api(method, path, json) {
+  return (await request(method, path, json)).body;
 }
 
 /** The newest `deadWanted` dead deliveries, following X-Next-Cursor, plus the total. */
@@ -97,6 +100,24 @@ function statusBadge(status) {
 
 const STATUS_ORDER = ["succeeded", "dead", "in_progress", "pending"];
 
+const AUTO_PAUSE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+function endpointState(endpoint) {
+  if (!endpoint.is_active && endpoint.auto_paused_at) {
+    const badge = el("span", { class: "badge paused" }, "auto-paused");
+    badge.title = `Every attempt failed from ${time(endpoint.failing_since)}; paused ${time(endpoint.auto_paused_at)}.`;
+    return badge;
+  }
+  if (!endpoint.is_active) return statusBadge("paused");
+  if (endpoint.failing_since) {
+    const badge = el("span", { class: "badge failing" }, "failing");
+    const pauseAt = new Date(new Date(endpoint.failing_since).getTime() + AUTO_PAUSE_AFTER_MS);
+    badge.title = `Every attempt has failed since ${time(endpoint.failing_since)}. Paused automatically at ${pauseAt.toLocaleString()} unless one succeeds.`;
+    return badge;
+  }
+  return statusBadge("active");
+}
+
 function countBadges(counts) {
   const entries = STATUS_ORDER.filter((status) => counts[status]).map((status) => [status, counts[status]]);
   if (entries.length === 0) return el("span", { class: "muted" }, "no subscribers");
@@ -127,7 +148,7 @@ function renderEndpoints(endpoints, stats) {
     return row(
       el("td", { class: "url", title: endpoint.url }, endpoint.url),
       endpoint.event_types.join(", "),
-      endpoint.is_active ? statusBadge("active") : statusBadge("paused"),
+      el("td", {}, endpointState(endpoint)),
       rateCell,
       num(d.succeeded || 0),
       num(d.dead || 0),
@@ -135,7 +156,8 @@ function renderEndpoints(endpoints, stats) {
       // Labelled with the all-time dead count: that's what replay-dead acts on, not the 24 h figure.
       el(
         "td",
-        {},
+        { class: "actions" },
+        endpoint.is_active ? null : el("button", { type: "button", onclick: (e) => resumeEndpoint(endpoint, e.currentTarget) }, "Resume"),
         el(
           "button",
           { type: "button", class: "secondary", disabled: s.dead_total === 0, onclick: (e) => replayEndpoint(endpoint, s.dead_total, e.currentTarget) },
@@ -243,6 +265,17 @@ async function replayDelivery(delivery, button) {
   try {
     await api("POST", `/deliveries/${delivery.id}/replay`);
     showMessage(`Delivery ${shortId(delivery.id)} is pending again and will be sent shortly.`);
+  } catch (error) {
+    handleError(error);
+  }
+  await refresh();
+}
+
+async function resumeEndpoint(endpoint, button) {
+  button.disabled = true;
+  try {
+    await api("PATCH", `/endpoints/${endpoint.id}`, { is_active: true });
+    showMessage(`Resumed ${endpoint.url}. Its waiting deliveries go out now; dead ones need a replay.`);
   } catch (error) {
     handleError(error);
   }

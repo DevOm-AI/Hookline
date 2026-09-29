@@ -8,7 +8,12 @@ settings = get_settings()
 celery_app = Celery(
     "hookline",
     broker=settings.broker_url,
-    include=["app.workers.delivery", "app.workers.scheduler", "app.workers.sweeper"],
+    include=[
+        "app.workers.auto_pause",
+        "app.workers.delivery",
+        "app.workers.scheduler",
+        "app.workers.sweeper",
+    ],
 )
 celery_app.conf.update(
     task_serializer="json",
@@ -33,6 +38,11 @@ celery_app.conf.update(
             "task": "hookline.sweep_stuck_deliveries",
             "schedule": 30.0,
             "options": {"expires": 30.0},
+        },
+        "pause-failing-endpoints": {
+            "task": "hookline.pause_failing_endpoints",
+            "schedule": 60.0,
+            "options": {"expires": 60.0},
         },
     },
 )

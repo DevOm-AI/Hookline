@@ -101,7 +101,7 @@ pre {
 }
 .badge.succeeded, .badge.active { background: var(--good-bg); color: var(--good); }
 .badge.dead, .badge.paused { background: var(--bad-bg); color: var(--bad); }
-.badge.pending, .badge.in_progress { background: var(--wait-bg); color: var(--wait); }
+.badge.pending, .badge.in_progress, .badge.failing { background: var(--wait-bg); color: var(--wait); }
 
 button {
   padding: 4px 12px;
@@ -115,6 +115,7 @@ button {
 button.secondary { background: transparent; color: var(--accent); }
 button.link { padding: 0; border: 0; background: none; color: var(--accent); }
 button.more { margin-top: 12px; }
+.actions { display: flex; gap: 6px; }
 button:disabled { opacity: 0.5; cursor: default; }
 
 #message { margin: 0 0 8px; padding: 8px 12px; border-radius: 6px; background: var(--good-bg); color: var(--good); }

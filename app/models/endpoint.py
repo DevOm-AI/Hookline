@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from sqlalchemy import CheckConstraint, Text, true
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
@@ -17,4 +19,9 @@ class Endpoint(Base):
     secret: Mapped[str] = mapped_column(Text)
     event_types: Mapped[list[str]] = mapped_column(ARRAY(Text))
     is_active: Mapped[bool] = mapped_column(default=True, server_default=true())
+    # When its current run of failed attempts began; None once an attempt succeeds. After
+    # 24 hours of nothing but failures the endpoint is paused (app/workers/auto_pause.py).
+    failing_since: Mapped[datetime | None]
+    # Set when that pause was automatic; resuming clears it.
+    auto_paused_at: Mapped[datetime | None]
     created_at: Mapped[CreatedAt]

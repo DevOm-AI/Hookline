@@ -43,6 +43,12 @@ class EndpointOut(BaseModel):
     url: str
     event_types: list[str]
     is_active: bool
+    failing_since: datetime | None = Field(
+        description="Since when every attempt has failed; null if the last one succeeded."
+    )
+    auto_paused_at: datetime | None = Field(
+        description="Set if Hookline paused it after 24 hours of failures; cleared on resume."
+    )
     created_at: datetime
 
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import httpx2
-from sqlalchemy import func, select, update
+from sqlalchemy import Update, func, select, update
 from sqlalchemy.orm import joinedload
 
 from app.core.config import get_settings
@@ -18,7 +18,7 @@ from app.core.url_safety import (
     UnsafeURLError,
     resolve_public_addresses,
 )
-from app.models import Delivery, DeliveryAttempt, DeliveryStatus
+from app.models import Delivery, DeliveryAttempt, DeliveryStatus, Endpoint
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class Outgoing:
     """Everything needed to send, read up front so no transaction stays open during the POST."""
 
     url: str
+    endpoint_id: uuid.UUID
     # Attempts made before this one.
     attempt_count: int
     # The lock as this worker's claim set it. Every claim sets a new one, so it identifies the
@@ -122,6 +123,7 @@ def _load(delivery_id: uuid.UUID) -> Outgoing | None:
 
         return Outgoing(
             url=delivery.endpoint.url,
+            endpoint_id=delivery.endpoint_id,
             attempt_count=delivery.attempt_count,
             locked_until=delivery.locked_until,
             secret=delivery.endpoint.secret,
@@ -227,6 +229,25 @@ def retry_delay(attempt: int) -> timedelta:
     return RETRY_DELAYS[attempt - 1] * random.uniform(1 - JITTER, 1 + JITTER)
 
 
+def _track_endpoint_health(endpoint_id: uuid.UUID, succeeded: bool) -> Update:
+    """Start the endpoint's failing streak on a failure, or end it on a success.
+
+    Each only matches when it changes something, so an endpoint that keeps succeeding (or
+    keeps failing) isn't written, or locked, on every attempt.
+    """
+    if succeeded:
+        return (
+            update(Endpoint)
+            .where(Endpoint.id == endpoint_id, Endpoint.failing_since.is_not(None))
+            .values(failing_since=None)
+        )
+    return (
+        update(Endpoint)
+        .where(Endpoint.id == endpoint_id, Endpoint.failing_since.is_(None))
+        .values(failing_since=func.now())
+    )
+
+
 def _record(delivery_id: uuid.UUID, outgoing: Outgoing, result: AttemptResult) -> None:
     """Log the attempt and move the delivery on: succeeded, pending for a retry, or dead.
 
@@ -279,6 +300,7 @@ def _record(delivery_id: uuid.UUID, outgoing: Outgoing, result: AttemptResult) -
                 error=result.error,
             )
         )
+        db.execute(_track_endpoint_health(outgoing.endpoint_id, result.succeeded))
         db.commit()
     logger.info(
         "Delivery %s attempt %d/%d: %s, %s",

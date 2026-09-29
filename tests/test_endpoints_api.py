@@ -76,6 +76,8 @@ def test_create_returns_secret_once(client: TestClient, db: Session):
     assert body["url"] == "https://example.com/hook"
     assert body["event_types"] == ["order.shipped"]
     assert body["is_active"] is True
+    assert body["failing_since"] is None
+    assert body["auto_paused_at"] is None
     assert body["created_at"]
     assert db.get(Endpoint, uuid.UUID(body["id"])).secret == body["secret"]
 
@@ -257,3 +259,16 @@ def test_stats_dead_total_is_per_endpoint(client: TestClient, db: Session):
     assert stats[str(first.id)]["dead_total"] == 3
     assert stats[str(second.id)]["dead_total"] == 1
     assert stats[str(second.id)]["deliveries"] == {"dead": 1, "succeeded": 1}
+
+
+def test_pausing_by_hand_is_not_an_auto_pause(client: TestClient, db: Session):
+    endpoint_id = create(client)["id"]
+    failing_since = db.scalar(select(func.now())) - timedelta(hours=2)
+    db.get(Endpoint, uuid.UUID(endpoint_id)).failing_since = failing_since
+    db.commit()
+
+    body = client.patch(f"/endpoints/{endpoint_id}", json={"is_active": False}).json()
+
+    assert body["auto_paused_at"] is None
+    # Pausing isn't a fix, so the streak is kept.
+    assert body["failing_since"] is not None

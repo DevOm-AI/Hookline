@@ -139,6 +139,27 @@ conditional `UPDATE`, so a delivery a worker is sending is never touched and a d
 replays once. Replayed deliveries of a paused endpoint wait as `pending` until it's resumed.
 The receiver gets the same `Hookline-Event-Id` again, so its dedupe still applies.
 
+### Auto-pause
+
+An endpoint that fails every attempt for 24 hours is paused automatically, so workers stop
+spending time on it. The first failed attempt after a success sets the endpoint's
+`failing_since`, and the next success clears it. Once a minute a beat job pauses every
+active endpoint whose `failing_since` is 24 hours old (`is_active = false`, `auto_paused_at`
+set) and logs a warning. Both fields are in `GET /endpoints`, and the dashboard shows the
+endpoint as "failing" (with the time it will be paused) and then "auto-paused".
+
+Pausing loses nothing already accepted: its pending and retrying deliveries wait as
+`pending`. As with a manual pause, though, events that arrive while it's paused create no
+delivery for it. Once the receiver is fixed, resume it (the dashboard's Resume button, or
+the request below), and replay its dead deliveries if you want them too. Resuming clears
+`failing_since` and `auto_paused_at`, so it gets a fresh 24 hours.
+
+```bash
+curl -X PATCH localhost:8000/endpoints/<id> \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -d '{"is_active": true}'
+```
+
 ### Recovering stuck deliveries
 
 If a worker dies mid-send, or a queued task is lost, its delivery would stay `in_progress`
@@ -176,7 +197,8 @@ http://localhost:8000/dashboard shows the endpoints with their success rate, the
 dead-letter list with each delivery's last error and a Replay button, and recent events.
 Click an event id to see every delivery and attempt. It refreshes every 10 seconds. Dead
 letters load 100 at a time ("Load more"), and each endpoint's "Replay all N dead" names the
-full count it will replay, old deliveries included, and asks before doing it.
+full count it will replay, old deliveries included, and asks before doing it. Paused
+endpoints get a Resume button.
 
 It's a static page (`app/dashboard/`) that calls the JSON API. The API key you enter is
 kept only in the page's memory: not in `sessionStorage`, `localStorage` or a cookie, so no
