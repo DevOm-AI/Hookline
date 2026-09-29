@@ -8,8 +8,8 @@
 #   EVENTS=1000 scripts/chaos_test.sh            # a quicker one
 #
 # Needs ALLOWED_INTERNAL_HOSTS=receiver:9000 in .env (see .env.example). Leaves the stack
-# running with one worker again. Exits 1 if any event was lost, the load fell short, or the
-# workers couldn't be restored.
+# running with one worker again. Exits 1 if any event was lost, the load fell short, no
+# worker was killed, or the workers couldn't be restored.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,8 +27,13 @@ killer_pid=
 finish() {
   local status=$?
   if [ -n "$killer_pid" ]; then
+    # Its sleep (or docker command) too, found first: once the loop is gone it's reparented.
+    local children
+    children=$(pgrep -P "$killer_pid" || true)
     kill "$killer_pid" 2>/dev/null || true
     wait "$killer_pid" 2>/dev/null || true
+    # shellcheck disable=SC2086  # one pid per word
+    [ -z "$children" ] || kill $children 2>/dev/null || true
   fi
   rm -f "$kill_log"
   # Starts the one worker kept, even if it was the last one killed, and removes the rest.
@@ -55,16 +60,22 @@ wait_healthy() {
 }
 
 kill_random_workers() {
+  # Keep going if one docker command fails (set -e would end the loop, and the kills with it):
+  # a kill is logged, and counted by scripts/chaos.py, only once docker kill succeeded.
+  set +e
   while true; do
     sleep "$KILL_EVERY"
     # Running workers only: one still down from the last kill isn't picked again.
     victim=$(docker compose ps -q worker | shuf -n 1)
     [ -n "$victim" ] || continue
     name=$(docker inspect -f '{{.Name}}' "$victim")
-    docker kill "$victim" >/dev/null
-    echo "$(date -u +%FT%TZ) killed ${name#/}" | tee -a "$kill_log"
+    if docker kill "$victim" >/dev/null; then
+      echo "$(date -u +%FT%TZ) killed ${name#/}" | tee -a "$kill_log"
+    else
+      echo "Couldn't kill ${name#/}; trying another next time" >&2
+    fi
     sleep "$DOWN_FOR"
-    docker start "$victim" >/dev/null
+    docker start "$victim" >/dev/null || echo "Couldn't start ${name#/} again" >&2
   done
 }
 

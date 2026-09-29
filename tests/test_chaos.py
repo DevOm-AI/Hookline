@@ -68,7 +68,7 @@ DELIVERED = {"a": record(100), "b": record(100)}
 def test_a_full_run_with_nothing_lost_has_no_shortfalls():
     result = ChaosResult.measure({"a": T0, "b": T0}, DELIVERED)
 
-    assert shortfalls(result, K6, events_requested=2) == []
+    assert shortfalls(result, K6, events_requested=2, workers_killed=3) == []
 
 
 @pytest.mark.parametrize(
@@ -84,4 +84,22 @@ def test_a_run_that_fell_short_fails(k6: dict, created: dict, expected: str):
     """Zero lost proves little if the requested load never happened."""
     result = ChaosResult.measure(created, DELIVERED)
 
-    assert any(problem.startswith(expected) for problem in shortfalls(result, k6, 2))
+    problems = shortfalls(result, k6, events_requested=2, workers_killed=3)
+
+    assert any(problem.startswith(expected) for problem in problems)
+
+
+def test_a_run_where_no_worker_was_killed_fails():
+    """Everything delivered, but the failure this test is about never happened."""
+    result = ChaosResult.measure({"a": T0, "b": T0}, DELIVERED)
+
+    assert shortfalls(result, K6, events_requested=2, workers_killed=0) == [
+        "No worker was killed: raise the events or lower KILL_EVERY"
+    ]
+
+
+def test_kills_are_not_checked_without_a_kill_log():
+    """scripts/chaos.py on its own, with nothing killing workers: nothing to count."""
+    result = ChaosResult.measure({"a": T0, "b": T0}, DELIVERED)
+
+    assert shortfalls(result, K6, events_requested=2, workers_killed=None) == []

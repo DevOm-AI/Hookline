@@ -80,13 +80,18 @@ class ChaosResult:
         )
 
 
-def shortfalls(result: ChaosResult, k6: dict, events_requested: int) -> list[str]:
+def shortfalls(
+    result: ChaosResult, k6: dict, events_requested: int, workers_killed: int | None
+) -> list[str]:
     """Why this run didn't test what it set out to, if it didn't.
 
-    Zero lost proves little if the load never happened: every requested event must have been
-    sent and accepted, and every accepted one delivered.
+    Zero lost proves little if the load or the failures never happened: every requested event
+    must have been sent and accepted, and every accepted one delivered, with at least one worker
+    killed on the way. workers_killed is None when nothing was killing them (no --kill-log).
     """
     problems = []
+    if workers_killed == 0:
+        problems.append("No worker was killed: raise the events or lower KILL_EVERY")
     if k6["dropped"]:
         problems.append(f"k6 dropped {k6['dropped']} requests: the rate wasn't held")
     if k6["accepted"] < k6["requests"]:
@@ -130,7 +135,9 @@ def main() -> None:
     parser.add_argument("--fail-percent", type=float, default=20)
     parser.add_argument("--drain-timeout", type=float, default=90, help="seconds, retries as is")
     parser.add_argument("--settle-timeout", type=float, default=600, help="seconds")
-    parser.add_argument("--kill-log", type=Path, help="one line per worker killed")
+    parser.add_argument(
+        "--kill-log", type=Path, help="one line per worker killed; none in it fails the run"
+    )
     parser.add_argument("--api-url", default="http://localhost:8000")
     parser.add_argument("--k6-api-url", default="http://api:8000")
     parser.add_argument("--receiver-url", default="http://localhost:9000")
@@ -243,7 +250,7 @@ Settled:                 {made_due} retries made due, {replayed} dead replayed""
     path.write_text(json.dumps(report, indent=2, default=str))
     print(f"Saved {path.relative_to(ROOT)}")
 
-    problems = shortfalls(result, k6, args.events) + failures
+    problems = shortfalls(result, k6, args.events, kills) + failures
     if problems:
         sys.exit("\nFAILED:\n" + "\n".join(problems))
     print("\nPASSED: every event sent was accepted and delivered.")
