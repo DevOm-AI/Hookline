@@ -19,6 +19,9 @@ class Endpoint(Base):
     secret: Mapped[str] = mapped_column(Text)
     event_types: Mapped[list[str]] = mapped_column(ARRAY(Text))
     is_active: Mapped[bool] = mapped_column(default=True, server_default=true())
+    # When it was paused (by hand or automatically); None while active. Events accepted while
+    # paused get no delivery for it; POST /endpoints/{id}/recover creates them from here on.
+    paused_at: Mapped[datetime | None]
     # When its current run of failed attempts began; None once an attempt succeeds. After
     # 24 hours of nothing but failures the endpoint is paused (app/workers/auto_pause.py).
     failing_since: Mapped[datetime | None]

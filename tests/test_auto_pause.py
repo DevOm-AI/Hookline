@@ -40,6 +40,7 @@ def test_pauses_endpoint_that_failed_everything_for_24_hours(db: Session):
     db.refresh(endpoint)
     assert endpoint.is_active is False
     assert endpoint.auto_paused_at == now(db)
+    assert endpoint.paused_at == now(db)
     # Kept, so it shows when the trouble began.
     assert endpoint.failing_since == failing_since == now(db) - timedelta(hours=25)
 

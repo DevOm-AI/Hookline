@@ -30,7 +30,7 @@ def pause_failing_endpoints(db: Session, failing_for: timedelta = FAILING_FOR) -
                 # The database clock, like the worker that set failing_since.
                 Endpoint.failing_since <= func.now() - failing_for,
             )
-            .values(is_active=False, auto_paused_at=func.now())
+            .values(is_active=False, paused_at=func.now(), auto_paused_at=func.now())
             .returning(Endpoint.id, Endpoint.url, Endpoint.failing_since)
         )
     )

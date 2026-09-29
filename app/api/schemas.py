@@ -43,6 +43,9 @@ class EndpointOut(BaseModel):
     url: str
     event_types: list[str]
     is_active: bool
+    paused_at: datetime | None = Field(
+        description="When it was paused, by hand or automatically; null while active."
+    )
     failing_since: datetime | None = Field(
         description="Since when every attempt has failed; null if the last one succeeded."
     )
@@ -50,6 +53,16 @@ class EndpointOut(BaseModel):
         description="Set if Hookline paused it after 24 hours of failures; cleared on resume."
     )
     created_at: datetime
+
+
+class EndpointUpdated(EndpointOut):
+    recover_since: datetime | None = Field(
+        description=(
+            "Set when this request resumed the endpoint: pass it as `since` to "
+            "POST /endpoints/{id}/recover to deliver the events that arrived while it was "
+            "paused. Resuming doesn't do that by itself."
+        )
+    )
 
 
 class EndpointCreated(EndpointOut):
@@ -137,3 +150,8 @@ class EndpointStats(BaseModel):
     dead_total: int = Field(
         description="Dead deliveries of any age: what POST /endpoints/{id}/replay-dead replays."
     )
+
+
+class RecoveredDeliveries(BaseModel):
+    created: int = Field(description="Pending deliveries created for events that had none.")
+    since: datetime = Field(description="Events created from this time on were considered.")

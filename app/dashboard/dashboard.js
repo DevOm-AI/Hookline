@@ -108,7 +108,11 @@ function endpointState(endpoint) {
     badge.title = `Every attempt failed from ${time(endpoint.failing_since)}; paused ${time(endpoint.auto_paused_at)}.`;
     return badge;
   }
-  if (!endpoint.is_active) return statusBadge("paused");
+  if (!endpoint.is_active) {
+    const badge = statusBadge("paused");
+    if (endpoint.paused_at) badge.title = `Paused ${time(endpoint.paused_at)}.`;
+    return badge;
+  }
   if (endpoint.failing_since) {
     const badge = el("span", { class: "badge failing" }, "failing");
     const pauseAt = new Date(new Date(endpoint.failing_since).getTime() + AUTO_PAUSE_AFTER_MS);
@@ -274,8 +278,12 @@ async function replayDelivery(delivery, button) {
 async function resumeEndpoint(endpoint, button) {
   button.disabled = true;
   try {
-    await api("PATCH", `/endpoints/${endpoint.id}`, { is_active: true });
-    showMessage(`Resumed ${endpoint.url}. Its waiting deliveries go out now; dead ones need a replay.`);
+    const { recover_since } = await api("PATCH", `/endpoints/${endpoint.id}`, { is_active: true });
+    // Resuming doesn't recover by itself: a receiver that just came back may not want a flood.
+    showMessage(
+      `Resumed ${endpoint.url}. Its waiting deliveries go out now. Events that arrived while it was paused ` +
+        `are sent only if you recover them: POST /endpoints/${endpoint.id}/recover?since=${recover_since}`,
+    );
   } catch (error) {
     handleError(error);
   }

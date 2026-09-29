@@ -30,3 +30,18 @@ def test_scheduler_index_exists(engine: Engine):
     }
 
     assert indexes["ix_deliveries_status_next_attempt_at"] == ["status", "next_attempt_at"]
+
+
+def test_one_delivery_per_event_and_endpoint_is_enforced(engine: Engine):
+    # Recovery and fan-out rely on it (ON CONFLICT DO NOTHING) to never duplicate.
+    constraints = {
+        c["name"]: c["column_names"] for c in inspect(engine).get_unique_constraints("deliveries")
+    }
+
+    assert constraints["uq_deliveries_event_id_endpoint_id"] == ["event_id", "endpoint_id"]
+
+
+def test_recovery_index_exists(engine: Engine):
+    indexes = {i["name"]: i["column_names"] for i in inspect(engine).get_indexes("events")}
+
+    assert indexes["ix_events_created_at_id"] == ["created_at", "id"]

@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import String
+from sqlalchemy import Index, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (
+        # Recovery walks events in (created_at, id) order from a point in time, in batches.
+        Index("ix_events_created_at_id", "created_at", "id"),
+    )
 
     id: Mapped[UUIDPk]
     type: Mapped[str] = mapped_column(String(255))

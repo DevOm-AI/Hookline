@@ -1,9 +1,12 @@
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import AwareDatetime
+from sqlalchemy import Uuid, exists, func, literal, select, tuple_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
 
 from app.api.deliveries import replay_dead
 from app.api.deps import DbSession, require_api_key
@@ -13,13 +16,15 @@ from app.api.schemas import (
     EndpointOut,
     EndpointStats,
     EndpointUpdate,
+    EndpointUpdated,
+    RecoveredDeliveries,
     ReplayedDeliveries,
     StatusCounts,
 )
 from app.core.config import Settings, get_settings
 from app.core.security import generate_endpoint_secret
 from app.core.url_safety import UnsafeURLError, ensure_public_url
-from app.models import Delivery, DeliveryStatus, Endpoint
+from app.models import Delivery, DeliveryStatus, Endpoint, Event
 
 router = APIRouter(
     prefix="/endpoints",
@@ -28,6 +33,11 @@ router = APIRouter(
 )
 
 STATS_WINDOW = timedelta(hours=24)
+RECOVER_BATCH_SIZE = 1000
+# An event whose transaction began just before a pause has an earlier created_at, yet its
+# fan-out can run after the pause commits and skip the endpoint. The default recovery window
+# starts this much earlier to cover it; events that already have a delivery are skipped.
+PAUSE_RACE_MARGIN = timedelta(minutes=1)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -121,15 +131,26 @@ def get_endpoint(endpoint_id: uuid.UUID, db: DbSession) -> EndpointOut:
 
 
 @router.patch("/{endpoint_id}")
-def update_endpoint(endpoint_id: uuid.UUID, body: EndpointUpdate, db: DbSession) -> EndpointOut:
+def update_endpoint(endpoint_id: uuid.UUID, body: EndpointUpdate, db: DbSession) -> EndpointUpdated:
+    """Pause or resume. Resuming sends what was waiting, but not the events that arrived
+    while paused: recover those with POST /endpoints/{id}/recover, from `recover_since`."""
     endpoint = _get_or_404(db, endpoint_id)
-    endpoint.is_active = body.is_active
+    recover_from = None
     if body.is_active:
+        if not endpoint.is_active:
+            recover_from = _default_recover_since(endpoint)
+        endpoint.paused_at = None
         # A fresh start: otherwise the old failing streak would pause it again within a minute.
         endpoint.failing_since = None
         endpoint.auto_paused_at = None
+    elif endpoint.is_active:
+        # Only when it actually pauses: pausing again mustn't move the start of the gap.
+        endpoint.paused_at = func.now()
+    endpoint.is_active = body.is_active
     db.commit()
-    return EndpointOut.model_validate(endpoint)
+    return EndpointUpdated(
+        **EndpointOut.model_validate(endpoint).model_dump(), recover_since=recover_from
+    )
 
 
 @router.delete("/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -150,6 +171,90 @@ def replay_dead_deliveries(endpoint_id: uuid.UUID, db: DbSession) -> ReplayedDel
     replayed = db.scalars(replay_dead(Delivery.endpoint_id == endpoint_id)).all()
     db.commit()
     return ReplayedDeliveries(replayed=len(replayed))
+
+
+@router.post("/{endpoint_id}/recover")
+def recover_deliveries(
+    endpoint_id: uuid.UUID,
+    db: DbSession,
+    since: Annotated[
+        AwareDatetime | None,
+        Query(description="Default: while paused, a minute before paused_at."),
+    ] = None,
+) -> RecoveredDeliveries:
+    """Create pending deliveries for events that arrived while this endpoint was paused.
+
+    Every event of a subscribed type created since `since` that has no delivery for this
+    endpoint gets one. Safe to repeat: the unique (event_id, endpoint_id) constraint and ON
+    CONFLICT DO NOTHING make a second run create nothing. If the endpoint is still paused,
+    they wait as pending until it's resumed.
+    """
+    endpoint = _get_or_404(db, endpoint_id)
+    if since is None:
+        since = _default_recover_since(endpoint)
+        if since is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Endpoint isn't paused: pass `since` (recover_since from the resume)",
+            )
+    created = _create_missing_deliveries(db, endpoint, since)
+    return RecoveredDeliveries(created=created, since=since)
+
+
+def _default_recover_since(endpoint: Endpoint) -> datetime | None:
+    if endpoint.paused_at is None:
+        return None
+    # Never before it existed: older events were never meant for it.
+    return max(endpoint.paused_at - PAUSE_RACE_MARGIN, endpoint.created_at)
+
+
+def _create_missing_deliveries(
+    db: Session, endpoint: Endpoint, since: datetime, batch_size: int = RECOVER_BATCH_SIZE
+) -> int:
+    """Insert the missing deliveries a batch at a time, committing each batch.
+
+    A long pause can leave many events behind; one transaction for all of them would hold
+    its locks and grow its WAL for as long as it runs. Each batch picks up where the last
+    one stopped, in (created_at, id) order, so rows inserted meanwhile don't shift it.
+    """
+    missing = (
+        select(Event.created_at, Event.id)
+        .where(
+            Event.type.in_(endpoint.event_types),
+            Event.created_at >= since,
+            ~exists().where(Delivery.event_id == Event.id, Delivery.endpoint_id == endpoint.id),
+        )
+        .order_by(Event.created_at, Event.id)
+        .limit(batch_size)
+    )
+    created = 0
+    after = None
+    while True:
+        batch = db.execute(
+            missing if after is None else missing.where(tuple_(Event.created_at, Event.id) > after)
+        ).all()
+        if not batch:
+            return created
+        # include_defaults=False: ids, status and next_attempt_at come from server defaults,
+        # as in fan-out. A concurrent recover or fan-out may insert a row first; skip it.
+        inserted = db.scalars(
+            pg_insert(Delivery)
+            .from_select(
+                ["event_id", "endpoint_id"],
+                select(Event.id, literal(endpoint.id, Uuid)).where(
+                    Event.id.in_([event_id for _, event_id in batch])
+                ),
+                include_defaults=False,
+            )
+            .on_conflict_do_nothing(index_elements=["event_id", "endpoint_id"])
+            # Only rows actually inserted come back, so skipped conflicts aren't counted.
+            .returning(Delivery.id)
+        ).all()
+        db.commit()
+        created += len(inserted)
+        if len(batch) < batch_size:
+            return created
+        after = tuple(batch[-1])
 
 
 def _get_or_404(db: DbSession, endpoint_id: uuid.UUID) -> Endpoint:
