@@ -80,6 +80,7 @@ not followed) with these headers:
 | --- | --- |
 | `Hookline-Event-Id` | The event's id. Dedupe on it: a delivery can arrive more than once. |
 | `Hookline-Event-Type` | The event's type, e.g. `order.shipped` |
+| `Hookline-Signature` | `t=<unix time>,v1=<hex HMAC-SHA256>`, see [Verifying signatures](#verifying-signatures) |
 
 Every try is logged in `delivery_attempts` with its status code, time taken and error. A
 2xx marks the delivery `succeeded`. Retries don't exist yet, so any other response,
@@ -91,6 +92,60 @@ address (DNS rebinding) is blocked.
 
 Celery tasks are acknowledged only after they finish (`acks_late`) and requeued if a
 worker process dies mid-task.
+
+## Verifying signatures
+
+Each request is signed with the endpoint's secret (the `whsec_...` value returned when the
+endpoint was created):
+
+```
+Hookline-Signature: t=1727600000,v1=5f2c...
+v1 = hex(HMAC_SHA256(secret, f"{t}.{raw_body}"))
+```
+
+`t` is the time of that try, so every retry carries a fresh signature. Recompute the HMAC
+over the **raw** request body (parsing and re-serialising the JSON changes the bytes), and
+reject requests whose `t` is more than 5 minutes away from your clock. That stops a captured
+request from being replayed later. Copy this into your receiver (Python standard library
+only):
+
+<!-- verify_signature: tests/test_signing.py runs this exact code -->
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify_signature(secret: str, body: bytes, header: str, tolerance: int = 300) -> bool:
+    """Check a Hookline-Signature header against the raw request body."""
+    timestamp = None
+    signatures = []
+    for part in header.split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "t" and value.isdigit():
+            timestamp = int(value)
+        elif key == "v1":
+            signatures.append(value)
+    if timestamp is None or not signatures:
+        return False
+    if abs(time.time() - timestamp) > tolerance:
+        return False
+    message = f"{timestamp}.".encode() + body
+    expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, signature) for signature in signatures)
+```
+
+For example, in FastAPI:
+
+```python
+@app.post("/hook")
+async def hook(request: Request):
+    body = await request.body()
+    if not verify_signature(WEBHOOK_SECRET, body, request.headers.get("Hookline-Signature", "")):
+        raise HTTPException(status_code=401)
+    event = json.loads(body)
+    ...
+```
 
 ## Migrations
 

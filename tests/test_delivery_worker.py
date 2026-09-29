@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -6,16 +7,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx2
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core import signing
 from app.core.config import Settings
+from app.core.signing import verify_signature
 from app.models import Delivery, DeliveryAttempt, DeliveryStatus, Endpoint, Event
 from app.workers import delivery as worker
 from app.workers.celery_app import celery_app
-from app.workers.delivery import MAX_ERROR_BODY_BYTES, deliver
+from app.workers.delivery import MAX_ERROR_BODY_BYTES, Outgoing, deliver
 
 PAYLOAD = {"order_id": 42, "note": "café"}
+SECRET = "whsec_x"
 
 Handler = Callable[[httpx2.Request], httpx2.Response]
 
@@ -68,7 +72,7 @@ def add_delivery(
 ) -> Delivery:
     """A delivery as the scheduler leaves it: claimed (in_progress) and locked."""
     endpoint = Endpoint(
-        url=url, secret="whsec_x", event_types=["order.shipped"], is_active=endpoint_active
+        url=url, secret=SECRET, event_types=["order.shipped"], is_active=endpoint_active
     )
     event = Event(type="order.shipped", payload=PAYLOAD, idempotency_key=str(uuid.uuid4()))
     db.add_all([endpoint, event])
@@ -117,6 +121,43 @@ def test_posts_the_json_payload_with_event_headers(db: Session, receiver: Receiv
     assert request.headers["Content-Type"] == "application/json"
     assert request.headers["Hookline-Event-Id"] == str(delivery.event_id)
     assert request.headers["Hookline-Event-Type"] == "order.shipped"
+
+
+def test_signs_the_exact_bytes_sent_with_the_endpoint_secret(db: Session, receiver: Receiver):
+    run(db, add_delivery(db))
+
+    [request] = receiver.requests
+    header = request.headers["Hookline-Signature"]
+    assert re.fullmatch(r"t=\d+,v1=[0-9a-f]{64}", header)
+    assert verify_signature(SECRET, request.content, header)
+    assert not verify_signature("whsec_other", request.content, header)
+
+
+def test_every_try_is_signed_with_the_time_it_was_sent(
+    db: Session, receiver: Receiver, monkeypatch: pytest.MonkeyPatch
+):
+    clock = iter([1_727_600_000, 1_727_600_060])
+    monkeypatch.setattr(signing.time, "time", lambda: next(clock))
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+    db.execute(update(Delivery).values(status=DeliveryStatus.IN_PROGRESS))
+    run(db, delivery)
+
+    headers = [r.headers["Hookline-Signature"] for r in receiver.requests]
+    assert [h.split(",")[0] for h in headers] == ["t=1727600000", "t=1727600060"]
+
+
+def test_secret_stays_out_of_logs():
+    outgoing = Outgoing(
+        url="https://example.com/hook",
+        secret="whsec_do_not_log",
+        event_id=uuid.uuid4(),
+        event_type="order.shipped",
+        body=b"{}",
+    )
+
+    assert "whsec_do_not_log" not in repr(outgoing)
 
 
 def test_connects_to_the_checked_address_under_the_original_name(db: Session, receiver: Receiver):
@@ -365,6 +406,7 @@ def test_delivers_over_a_real_connection(
     assert request["headers"]["Host"] == f"localhost:{port}"
     assert request["headers"]["Hookline-Event-Id"] == str(delivery.event_id)
     assert json.loads(request["body"]) == PAYLOAD
+    assert verify_signature(SECRET, request["body"], request["headers"]["Hookline-Signature"])
 
 
 def test_loopback_receiver_is_blocked_without_debug(
