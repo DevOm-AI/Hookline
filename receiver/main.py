@@ -30,10 +30,11 @@ DelayMs = Annotated[int, Field(ge=0, le=60_000)]
 class Behaviour(BaseSettings):
     """How the receiver answers. Starts from RECEIVER_* environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="RECEIVER_")
+    # Compose passes RECEIVER_SECRET="" when it isn't set: that means unset, not an empty key.
+    model_config = SettingsConfigDict(env_prefix="RECEIVER_", env_ignore_empty=True)
 
     # The endpoint's signing secret, as POST /endpoints returned it. Unset = every request 401.
-    secret: str | None = Field(default=None, repr=False)
+    secret: str | None = Field(default=None, min_length=1, repr=False)
     # Share of validly signed requests answered 500, which Hookline retries.
     fail_percent: FailPercent = 0
     # Wait before answering every validly signed request.

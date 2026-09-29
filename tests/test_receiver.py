@@ -214,6 +214,18 @@ def test_behaviour_starts_from_the_environment(monkeypatch: pytest.MonkeyPatch):
     assert client.get("/config").json() == {"secret_set": True, "fail_percent": 20, "delay_ms": 250}
 
 
+def test_empty_environment_variables_mean_unset(monkeypatch: pytest.MonkeyPatch):
+    """What compose passes when RECEIVER_* aren't set: no secret, not an empty one."""
+    for name in ["RECEIVER_SECRET", "RECEIVER_FAIL_PERCENT", "RECEIVER_DELAY_MS"]:
+        monkeypatch.setenv(name, "")
+
+    client = TestClient(create_app())
+
+    assert client.get("/config").json() == {"secret_set": False, "fail_percent": 0, "delay_ms": 0}
+    # Signed with an empty key: still rejected.
+    assert send(client, secret="").status_code == 401
+
+
 def test_reset_forgets_what_was_received_but_keeps_the_config(client: TestClient):
     client.patch("/config", json={"delay_ms": 0, "fail_percent": 0})
     send(client)
