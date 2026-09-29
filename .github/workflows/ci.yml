@@ -40,6 +40,8 @@ jobs:
     env:
       DATABASE_URL: postgresql+psycopg://hookline:hookline@localhost:5432/hookline
       REDIS_URL: redis://localhost:6379/0
+      # Read by tests/conftest.py; created on first run, kept apart from DATABASE_URL.
+      TEST_DATABASE_URL: postgresql+psycopg://hookline:hookline@localhost:5432/hookline_test
 
     steps:
       - uses: actions/checkout@v5

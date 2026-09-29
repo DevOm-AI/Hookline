@@ -40,8 +40,16 @@ uv run ruff format alembic/versions && uv run ruff check alembic/versions
 
 ## Tests and lint
 
+Tests run against a real Postgres, in a separate `hookline_test` database that is
+created and migrated automatically. Your dev database is never touched.
+
 ```bash
 uv sync
+docker compose up -d postgres
 uv run ruff check .
 uv run pytest
 ```
+
+By default tests connect to the compose Postgres at `localhost:5433`. To use a different
+server, set `TEST_DATABASE_URL` in your shell (it is not read from `.env`); the database
+name must end in `_test`.
