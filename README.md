@@ -1,5 +1,7 @@
 # Hookline
 
+![CI](https://github.com/DevOm-AI/Hookline/actions/workflows/ci.yml/badge.svg)
+
 A webhook delivery service that doesn't lose events.
 
 > Work in progress. The full README (architecture, design decisions, chaos test results) comes later.
