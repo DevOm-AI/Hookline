@@ -1,9 +1,12 @@
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, delete, func, select, text
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
@@ -98,6 +101,75 @@ def test_same_idempotency_key_returns_original_and_creates_nothing(client: TestC
     assert count_events(db, "same-key") == 1
     assert len(deliveries_for(db, first.json()["id"])) == 1
     assert db.get(Event, uuid.UUID(first.json()["id"])).payload == {"order_id": 42}
+
+
+def wait_for_insert_blocked_by(engine: Engine, blocker_pid: int, timeout: float = 5.0) -> None:
+    """Return once an INSERT INTO events is waiting on the backend `blocker_pid`.
+
+    Tied to that backend, so a blocked insert from anything else sharing the test database
+    (another test run, say) can't satisfy it.
+    """
+    # Autocommit: pg_stat_activity is read once per transaction and cached until it ends.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            waiting = connection.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE :blocker = ANY(pg_blocking_pids(pid))"
+                    " AND query ILIKE 'INSERT INTO events%'"
+                ),
+                {"blocker": blocker_pid},
+            )
+            if waiting:
+                return
+            time.sleep(0.01)
+    raise AssertionError("the second request's insert never waited on the first one")
+
+
+def test_concurrent_requests_with_the_same_key_create_one_event(
+    committed_client: TestClient, engine: Engine, monkeypatch: pytest.MonkeyPatch
+):
+    """The retry arrives while the first request is still in its transaction.
+
+    Its insert waits on the first one's uncommitted key, then does nothing once that commits:
+    one event and one set of deliveries, and both callers get the same event back.
+    """
+    key = f"race-{uuid.uuid4()}"
+    with Session(engine) as setup:
+        endpoint_id = add_endpoint(setup, ["order.shipped"]).id
+        setup.commit()
+
+    first_inserted = threading.Event()
+    fan_out = events_api._fan_out
+
+    def fan_out_once_the_second_request_waits(db: Session, event: Event) -> None:
+        first_inserted.set()
+        wait_for_insert_blocked_by(engine, db.scalar(text("SELECT pg_backend_pid()")))
+        fan_out(db, event)
+
+    monkeypatch.setattr(events_api, "_fan_out", fan_out_once_the_second_request_waits)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(post_event, committed_client, key)
+            assert first_inserted.wait(timeout=5)
+            second = pool.submit(post_event, committed_client, key)
+            first, second = first.result(timeout=10), second.result(timeout=10)
+
+        assert (first.status_code, second.status_code) == (202, 202)
+        assert first.json() == second.json()
+        assert "Idempotent-Replayed" not in first.headers
+        assert second.headers["Idempotent-Replayed"] == "true"
+        with Session(engine) as check:
+            assert count_events(check, key) == 1
+            assert len(deliveries_for(check, first.json()["id"])) == 1
+    finally:
+        # Really committed, so remove it for the tests that follow. Deliveries cascade.
+        with Session(engine) as cleanup:
+            cleanup.execute(delete(Event).where(Event.idempotency_key == key))
+            cleanup.execute(delete(Endpoint).where(Endpoint.id == endpoint_id))
+            cleanup.commit()
 
 
 def test_event_is_not_saved_when_fan_out_fails(
