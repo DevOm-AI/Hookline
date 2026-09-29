@@ -1,12 +1,13 @@
+import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Uuid, any_, insert, literal, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.api.deps import DbSession, require_api_key
-from app.api.schemas import EventAccepted, EventCreate
+from app.api.schemas import EventAccepted, EventCreate, EventOut
 from app.models import Delivery, Endpoint, Event
 
 router = APIRouter(
@@ -40,6 +41,24 @@ def create_event(
     # Event and deliveries commit together (outbox): never an event that can't be sent.
     db.commit()
     return EventAccepted.model_validate(event)
+
+
+@router.get("/{event_id}")
+def get_event(event_id: uuid.UUID, db: DbSession) -> EventOut:
+    """The event with every delivery and every attempt: the answer to "did you send it?"."""
+    event = db.scalar(
+        select(Event)
+        .where(Event.id == event_id)
+        # A fixed number of queries however many deliveries and attempts there are.
+        .options(
+            selectinload(Event.deliveries).options(
+                joinedload(Delivery.endpoint), selectinload(Delivery.attempts)
+            )
+        )
+    )
+    if event is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+    return EventOut.model_validate(event)
 
 
 def _fan_out(db: Session, event: Event) -> None:

@@ -21,5 +21,8 @@ class Event(Base):
     created_at: Mapped[CreatedAt]
 
     deliveries: Mapped[list["Delivery"]] = relationship(
-        back_populates="event", passive_deletes=True
+        back_populates="event",
+        passive_deletes=True,
+        # Fan-out creates them all at once, so the id keeps the order stable.
+        order_by="(Delivery.created_at, Delivery.id)",
     )

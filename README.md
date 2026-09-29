@@ -63,7 +63,14 @@ curl -X POST localhost:8000/events \
   -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
   -H "Idempotency-Key: order-42-shipped" \
   -d '{"type": "order.shipped", "payload": {"order_id": 42}}'
+
+# "Did you send it?": the event, each delivery (endpoint, status) and every attempt
+# (status code, response time, error, when), oldest first.
+curl localhost:8000/events/<id> -H "Authorization: Bearer hk_local_dev_key"
 ```
+
+Attempts from before a [replay](#dead-letters-and-replay) stay in the list, so a delivery can
+show more attempts than its `attempt_count`, which counts only those since the last replay.
 
 ## Delivery
 

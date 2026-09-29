@@ -2,7 +2,15 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
+from pydantic import (
+    AfterValidator,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    StringConstraints,
+)
 
 from app.models import DeliveryStatus
 
@@ -55,6 +63,35 @@ class EventAccepted(BaseModel):
     id: uuid.UUID
     type: str
     created_at: datetime
+
+
+class AttemptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status_code: int | None = Field(description="None if there was no response.")
+    response_ms: int
+    error: str | None
+    created_at: datetime
+
+
+class EventDeliveryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    endpoint_id: uuid.UUID
+    endpoint_url: str = Field(validation_alias=AliasPath("endpoint", "url"))
+    status: DeliveryStatus
+    attempt_count: int = Field(description="Attempts since it was created or last replayed.")
+    next_attempt_at: datetime
+    created_at: datetime
+    attempts: list[AttemptOut] = Field(description="Every attempt, oldest first, replays included.")
+
+
+class EventOut(EventAccepted):
+    payload: dict[str, Any]
+    idempotency_key: str
+    deliveries: list[EventDeliveryOut]
 
 
 class DeliveryOut(BaseModel):
