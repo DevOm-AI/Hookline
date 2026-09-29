@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6380/0"
     # Falls back to redis_url when unset.
     celery_broker_url: str | None = None
+
+    # SHA-256 hex digest of the API key; the key itself is never stored.
+    # Generate a pair with `uv run python -m app.core.security`. Unset = every API call is 401.
+    api_key_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @property
     def broker_url(self) -> str:

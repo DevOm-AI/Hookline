@@ -21,6 +21,34 @@ Health check: http://localhost:8000/health
 Migrations run automatically: the `migrate` service applies `alembic upgrade head`
 before the api, worker and beat start.
 
+## API key
+
+Every route except `/health` needs `Authorization: Bearer <api key>`. Hookline stores only
+the key's SHA-256 hash, in `API_KEY_HASH`. The `.env.example` hash is for the local-only
+key `hk_local_dev_key`. For any deployed environment, generate a new pair:
+
+```bash
+uv run python -m app.core.security
+```
+
+## Endpoints
+
+```bash
+# Register an endpoint. The response includes its signing secret, shown only this once.
+curl -X POST localhost:8000/endpoints \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/hook", "event_types": ["order.shipped"]}'
+
+curl localhost:8000/endpoints -H "Authorization: Bearer hk_local_dev_key"
+
+# Pause (or resume with true)
+curl -X PATCH localhost:8000/endpoints/<id> \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -d '{"is_active": false}'
+
+curl -X DELETE localhost:8000/endpoints/<id> -H "Authorization: Bearer hk_local_dev_key"
+```
+
 ## Migrations
 
 Run Alembic inside a container, where `DATABASE_URL` points at the `postgres` service:

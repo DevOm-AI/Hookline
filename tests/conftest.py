@@ -5,10 +5,16 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+
+from app.core.config import Settings, get_settings
+from app.core.db import get_db
+from app.core.security import hash_api_key
+from app.main import app
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -75,3 +81,18 @@ def db(engine: Engine) -> Iterator[Session]:
         finally:
             session.close()
             transaction.rollback()
+
+
+TEST_API_KEY = "hk_test_key"
+
+
+@pytest.fixture
+def client(db: Session) -> Iterator[TestClient]:
+    """API client sending a valid API key, using the rolled-back test session."""
+    settings = Settings(_env_file=None, api_key_hash=hash_api_key(TEST_API_KEY))
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
+    finally:
+        app.dependency_overrides.clear()

@@ -1,0 +1,172 @@
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.core.config import Settings, get_settings
+from app.main import app
+from app.models import Endpoint
+
+NEW_ENDPOINT = {"url": "https://example.com/hook", "event_types": ["order.shipped"]}
+
+ROUTES = [
+    ("POST", "/endpoints"),
+    ("GET", "/endpoints"),
+    ("GET", f"/endpoints/{uuid.uuid4()}"),
+    ("PATCH", f"/endpoints/{uuid.uuid4()}"),
+    ("DELETE", f"/endpoints/{uuid.uuid4()}"),
+]
+
+
+def create(client: TestClient, **overrides) -> dict:
+    response = client.post("/endpoints", json=NEW_ENDPOINT | overrides)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+# --- auth ---
+
+
+@pytest.mark.parametrize(("method", "path"), ROUTES)
+def test_routes_reject_missing_api_key(client: TestClient, method: str, path: str):
+    del client.headers["Authorization"]
+
+    response = client.request(method, path)
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize(
+    "header", ["Bearer wrong-key", "Basic aGs6dGVzdA==", "hk_test_key", "Bearer "]
+)
+def test_routes_reject_bad_api_key(client: TestClient, header: str):
+    response = client.get("/endpoints", headers={"Authorization": header})
+
+    assert response.status_code == 401
+
+
+def test_routes_fail_closed_without_configured_key(client: TestClient):
+    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None, api_key_hash=None)
+
+    assert client.get("/endpoints").status_code == 401
+
+
+def test_health_stays_public(client: TestClient):
+    del client.headers["Authorization"]
+
+    assert client.get("/health").status_code != 401
+
+
+# --- create ---
+
+
+def test_create_returns_secret_once(client: TestClient, db: Session):
+    body = create(client)
+
+    assert body["secret"].startswith("whsec_")
+    assert body["url"] == "https://example.com/hook"
+    assert body["event_types"] == ["order.shipped"]
+    assert body["is_active"] is True
+    assert body["created_at"]
+    assert db.get(Endpoint, uuid.UUID(body["id"])).secret == body["secret"]
+
+    listed = client.get("/endpoints").json()
+    fetched = client.get(f"/endpoints/{body['id']}").json()
+    assert "secret" not in listed[0]
+    assert "secret" not in fetched
+
+
+def test_each_endpoint_gets_its_own_secret(client: TestClient):
+    assert create(client)["secret"] != create(client)["secret"]
+
+
+def test_create_normalizes_event_types(client: TestClient):
+    body = create(client, event_types=[" order.shipped ", "order.paid", "order.shipped"])
+
+    assert body["event_types"] == ["order.shipped", "order.paid"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"url": "https://example.com/hook", "event_types": []},
+        {"url": "https://example.com/hook", "event_types": ["  "]},
+        {"url": "https://example.com/hook"},
+        {"url": "not a url", "event_types": ["a"]},
+        {"url": "ftp://example.com/hook", "event_types": ["a"]},
+        {"event_types": ["a"]},
+        # The secret is always generated, never chosen by the caller.
+        {"url": "https://example.com/hook", "event_types": ["a"], "secret": "mine"},
+    ],
+)
+def test_create_rejects_invalid_input(client: TestClient, payload: dict):
+    assert client.post("/endpoints", json=payload).status_code == 422
+
+
+# --- read ---
+
+
+def test_list_returns_all_endpoints(client: TestClient):
+    ids = {create(client)["id"], create(client)["id"]}
+
+    response = client.get("/endpoints")
+
+    assert response.status_code == 200
+    assert {endpoint["id"] for endpoint in response.json()} == ids
+
+
+def test_get_unknown_endpoint_is_404(client: TestClient):
+    assert client.get(f"/endpoints/{uuid.uuid4()}").status_code == 404
+
+
+def test_get_with_malformed_id_is_422(client: TestClient):
+    assert client.get("/endpoints/not-a-uuid").status_code == 422
+
+
+# --- pause / resume ---
+
+
+def test_patch_pauses_and_resumes(client: TestClient):
+    endpoint_id = create(client)["id"]
+
+    paused = client.patch(f"/endpoints/{endpoint_id}", json={"is_active": False})
+    assert paused.status_code == 200
+    assert paused.json()["is_active"] is False
+    assert client.get(f"/endpoints/{endpoint_id}").json()["is_active"] is False
+
+    resumed = client.patch(f"/endpoints/{endpoint_id}", json={"is_active": True})
+    assert resumed.json()["is_active"] is True
+
+
+@pytest.mark.parametrize(
+    "payload", [{}, {"is_active": "maybe"}, {"is_active": False, "url": "https://x.io"}]
+)
+def test_patch_rejects_invalid_input(client: TestClient, payload: dict):
+    endpoint_id = create(client)["id"]
+
+    assert client.patch(f"/endpoints/{endpoint_id}", json=payload).status_code == 422
+
+
+def test_patch_unknown_endpoint_is_404(client: TestClient):
+    response = client.patch(f"/endpoints/{uuid.uuid4()}", json={"is_active": False})
+
+    assert response.status_code == 404
+
+
+# --- delete ---
+
+
+def test_delete_removes_endpoint(client: TestClient):
+    endpoint_id = create(client)["id"]
+
+    response = client.delete(f"/endpoints/{endpoint_id}")
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert client.get(f"/endpoints/{endpoint_id}").status_code == 404
+
+
+def test_delete_unknown_endpoint_is_404(client: TestClient):
+    assert client.delete(f"/endpoints/{uuid.uuid4()}").status_code == 404
