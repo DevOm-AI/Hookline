@@ -1,0 +1,112 @@
+# Production: one VM, Caddy in front. See docs/deploy.md.
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Unlike docker-compose.yml: no code mounts or --reload, Postgres and Redis unreachable from
+# outside the VM, and no test tools (mock receiver, k6).
+
+x-app: &app
+  build: .
+  image: hookline:prod
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  # Runs once and exits; nothing else starts until the schema is up to date.
+  migrate:
+    <<: *app
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # No host port: only Caddy reaches it, over the compose network.
+  api:
+    <<: *app
+    # --proxy-headers takes the client address and https scheme from Caddy's X-Forwarded-*
+    # headers. Any sender is trusted because nothing but Caddy can connect to this port.
+    command: >-
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+      --proxy-headers --forwarded-allow-ips=*
+    # The slim image has no curl; urlopen raises (exit 1) on the 503 from /health.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: celery -A app.workers.celery_app:celery_app worker --loglevel=info
+    # docker stop sends SIGTERM: Celery finishes the requests in flight and takes no new ones.
+    # The default 10s before SIGKILL can cut a send short (connect, write and read each get
+    # 10s). Wait as long as the delivery lock; past that the sweeper hands it on anyway.
+    stop_grace_period: 60s
+
+  # Run exactly one beat, or scheduled jobs fire twice.
+  beat:
+    <<: *app
+    command: >-
+      celery -A app.workers.celery_app:celery_app beat --loglevel=info
+      --schedule /tmp/celerybeat-schedule
+
+  # HTTPS on DOMAIN with a Let's Encrypt certificate, obtained and renewed automatically.
+  # DOMAIN must resolve to this VM and ports 80 and 443 must be open for the ACME challenge.
+  caddy:
+    image: caddy:2.11-alpine
+    command: caddy reverse-proxy --from ${DOMAIN:?set DOMAIN in .env} --to api:8000
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      # Certificates and the ACME account. Keep them: re-issuing on every restart would hit
+      # Let's Encrypt's rate limits.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    # POSTGRES_PASSWORD comes from .env as is. Left empty, Postgres refuses to initialise.
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-hookline}
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB=${POSTGRES_DB:-hookline}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # No persistence: Redis only wakes workers up, Postgres holds every delivery.
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:
