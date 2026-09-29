@@ -107,6 +107,28 @@ address (DNS rebinding) is blocked.
 Celery tasks are acknowledged only after they finish (`acks_late`) and requeued if a
 worker process dies mid-task.
 
+### Dead letters and replay
+
+A `dead` delivery stays in the database with every attempt logged. List them with the
+last attempt's status code and error, then send them again once the receiver is fixed:
+
+```bash
+# Newest first. Filter by status and/or endpoint_id; limit defaults to 100 (max 500).
+curl "localhost:8000/deliveries?status=dead" -H "Authorization: Bearer hk_local_dev_key"
+
+# Replay one: back to pending, due now, with a fresh 5 attempts.
+curl -X POST localhost:8000/deliveries/<id>/replay -H "Authorization: Bearer hk_local_dev_key"
+
+# Replay every dead delivery of one endpoint, e.g. after its outage. Returns {"replayed": n}.
+curl -X POST localhost:8000/endpoints/<id>/replay-dead -H "Authorization: Bearer hk_local_dev_key"
+```
+
+Replay sets `attempt_count` back to 0 and keeps the old attempts in the log. Only `dead`
+deliveries can be replayed; any other status gets a 409. The check and the reset are one
+conditional `UPDATE`, so a delivery a worker is sending is never touched and a double-click
+replays once. Replayed deliveries of a paused endpoint wait as `pending` until it's resumed.
+The receiver gets the same `Hookline-Event-Id` again, so its dedupe still applies.
+
 ### Recovering stuck deliveries
 
 If a worker dies mid-send, or a queued task is lost, its delivery would stay `in_progress`

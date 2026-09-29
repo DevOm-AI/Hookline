@@ -4,12 +4,19 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 
+from app.api.deliveries import replay_dead
 from app.api.deps import DbSession, require_api_key
-from app.api.schemas import EndpointCreate, EndpointCreated, EndpointOut, EndpointUpdate
+from app.api.schemas import (
+    EndpointCreate,
+    EndpointCreated,
+    EndpointOut,
+    EndpointUpdate,
+    ReplayedDeliveries,
+)
 from app.core.config import Settings, get_settings
 from app.core.security import generate_endpoint_secret
 from app.core.url_safety import UnsafeURLError, ensure_public_url
-from app.models import Endpoint
+from app.models import Delivery, Endpoint
 
 router = APIRouter(
     prefix="/endpoints",
@@ -68,6 +75,18 @@ def delete_endpoint(endpoint_id: uuid.UUID, db: DbSession) -> Response:
     db.delete(_get_or_404(db, endpoint_id))
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{endpoint_id}/replay-dead")
+def replay_dead_deliveries(endpoint_id: uuid.UUID, db: DbSession) -> ReplayedDeliveries:
+    """Send every dead delivery of this endpoint again, e.g. once it's back after an outage.
+
+    If the endpoint is paused, they wait as pending until it's resumed.
+    """
+    _get_or_404(db, endpoint_id)
+    replayed = db.scalars(replay_dead(Delivery.endpoint_id == endpoint_id)).all()
+    db.commit()
+    return ReplayedDeliveries(replayed=len(replayed))
 
 
 def _get_or_404(db: DbSession, endpoint_id: uuid.UUID) -> Endpoint:
