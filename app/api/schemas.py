@@ -128,3 +128,6 @@ class EndpointStats(BaseModel):
     success_rate: float | None = Field(
         description="succeeded / (succeeded + dead) in the window; None if none has finished."
     )
+    dead_total: int = Field(
+        description="Dead deliveries of any age: what POST /endpoints/{id}/replay-dead replays."
+    )

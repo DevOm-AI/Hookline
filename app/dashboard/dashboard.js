@@ -3,38 +3,27 @@
 // Everything on this page comes from the JSON API. Values (URLs, payloads, receivers' error
 // bodies) are untrusted, so they only ever go in through textContent, never innerHTML.
 
-const KEY_STORAGE = "hookline-api-key";
 const REFRESH_MS = 10000;
+const DEAD_PAGE_SIZE = 100;
 const $ = (id) => document.getElementById(id);
 
+// The API key lives only in this variable: never in sessionStorage or localStorage, where
+// another page of this origin opened later in the same tab (e.g. /docs) could read it.
+let apiKey = null;
 let refreshTimer = null;
+// Bumped by every refresh (and by logging out); a refresh that finishes after a newer one
+// started, or after logout, is stale and renders nothing.
+let refreshSeq = 0;
 let openEventId = null;
-let memoryKey = null;
-
-function getKey() {
-  try {
-    return sessionStorage.getItem(KEY_STORAGE);
-  } catch {
-    return null;
-  }
-}
-
-function setKey(key) {
-  try {
-    if (key) sessionStorage.setItem(KEY_STORAGE, key);
-    else sessionStorage.removeItem(KEY_STORAGE);
-  } catch {
-    // Storage blocked: the key lasts until the page is reloaded.
-  }
-  memoryKey = key;
-}
+// How many dead letters to show; "Load more" raises it a page at a time.
+let deadWanted = DEAD_PAGE_SIZE;
 
 class Unauthorized extends Error {}
 
-async function api(method, path) {
+async function request(method, path) {
   const response = await fetch(path, {
     method,
-    headers: { Authorization: `Bearer ${memoryKey}` },
+    headers: { Authorization: `Bearer ${apiKey}` },
   });
   if (response.status === 401) throw new Unauthorized();
   const body = await response.json().catch(() => null);
@@ -42,7 +31,28 @@ async function api(method, path) {
     const detail = body && typeof body.detail === "string" ? body.detail : response.statusText;
     throw new Error(`${method} ${path}: ${response.status} ${detail}`);
   }
-  return body;
+  return { body, headers: response.headers };
+}
+
+async function api(method, path) {
+  return (await request(method, path)).body;
+}
+
+/** The newest `deadWanted` dead deliveries, following X-Next-Cursor, plus the total. */
+async function fetchDead() {
+  const rows = [];
+  let cursor = null;
+  let total = 0;
+  do {
+    const limit = Math.min(500, deadWanted - rows.length);
+    const params = new URLSearchParams({ status: "dead", limit });
+    if (cursor) params.set("cursor", cursor);
+    const { body, headers } = await request("GET", `/deliveries?${params}`);
+    rows.push(...body);
+    total = Number(headers.get("X-Total-Count"));
+    cursor = headers.get("X-Next-Cursor");
+  } while (cursor && rows.length < deadWanted);
+  return { rows, total };
 }
 
 // --- DOM helpers ---
@@ -109,7 +119,7 @@ function showMessage(text, kind = "info") {
 function renderEndpoints(endpoints, stats) {
   const statsById = new Map(stats.map((s) => [s.endpoint_id, s]));
   const rows = endpoints.map((endpoint) => {
-    const s = statsById.get(endpoint.id) || { deliveries: {}, success_rate: null };
+    const s = statsById.get(endpoint.id) || { deliveries: {}, success_rate: null, dead_total: 0 };
     const d = s.deliveries;
     const rate = s.success_rate === null ? "–" : `${(s.success_rate * 100).toFixed(1)}%`;
     const rateCell = num(rate);
@@ -122,14 +132,24 @@ function renderEndpoints(endpoints, stats) {
       num(d.succeeded || 0),
       num(d.dead || 0),
       num((d.pending || 0) + (d.in_progress || 0)),
-      el("td", {}, el("button", { type: "button", class: "secondary", onclick: (e) => replayEndpoint(endpoint, e.currentTarget) }, "Replay dead")),
+      // Labelled with the all-time dead count: that's what replay-dead acts on, not the 24 h figure.
+      el(
+        "td",
+        {},
+        el(
+          "button",
+          { type: "button", class: "secondary", disabled: s.dead_total === 0, onclick: (e) => replayEndpoint(endpoint, s.dead_total, e.currentTarget) },
+          `Replay all ${s.dead_total} dead`,
+        ),
+      ),
     );
   });
   $("endpoints").replaceChildren(...(rows.length ? rows : [emptyRow(8, "No endpoints registered.")]));
 }
 
-function renderDead(dead, endpointUrls) {
-  $("dead-count").textContent = dead.length ? `(${dead.length})` : "";
+function renderDead({ rows: dead, total }, endpointUrls) {
+  $("dead-count").textContent = total > dead.length ? `(showing ${dead.length} of ${total})` : total ? `(${total})` : "";
+  $("dead-more").hidden = total <= dead.length;
   const rows = dead.map((delivery) => {
     const lastResult = delivery.last_status_code === null ? "" : `${delivery.last_status_code} · `;
     const error = `${lastResult}${delivery.last_error || "no attempt recorded"}`;
@@ -153,6 +173,8 @@ function renderEvents(events) {
 }
 
 function renderEventDetail(event) {
+  // A slow response for an event that has since been closed or swapped for another.
+  if (event.id !== openEventId) return;
   $("detail-id").textContent = event.id;
   $("detail-type").replaceChildren(el("code", {}, event.type));
   $("detail-created").textContent = `created ${time(event.created_at)} · key ${event.idempotency_key}`;
@@ -186,20 +208,23 @@ function renderEventDetail(event) {
 // --- actions ---
 
 async function refresh() {
+  const seq = ++refreshSeq;
   try {
-    const [endpoints, stats, dead, events] = await Promise.all([
+    const [endpoints, stats, dead, events, detail] = await Promise.all([
       api("GET", "/endpoints"),
       api("GET", "/endpoints/stats"),
-      api("GET", "/deliveries?status=dead&limit=100"),
+      fetchDead(),
       api("GET", "/events?limit=25"),
+      openEventId ? api("GET", `/events/${openEventId}`).catch(() => null) : null,
     ]);
+    if (seq !== refreshSeq) return;
     renderEndpoints(endpoints, stats);
     renderDead(dead, new Map(endpoints.map((e) => [e.id, e.url])));
     renderEvents(events);
-    if (openEventId) renderEventDetail(await api("GET", `/events/${openEventId}`));
+    if (detail) renderEventDetail(detail);
     $("updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
   } catch (error) {
-    handleError(error);
+    if (seq === refreshSeq) handleError(error);
   }
 }
 
@@ -224,7 +249,8 @@ async function replayDelivery(delivery, button) {
   await refresh();
 }
 
-async function replayEndpoint(endpoint, button) {
+async function replayEndpoint(endpoint, deadTotal, button) {
+  if (!confirm(`Send all ${deadTotal} dead deliveries to ${endpoint.url} again?`)) return;
   button.disabled = true;
   try {
     const { replayed } = await api("POST", `/endpoints/${endpoint.id}/replay-dead`);
@@ -232,7 +258,6 @@ async function replayEndpoint(endpoint, button) {
   } catch (error) {
     handleError(error);
   }
-  button.disabled = false;
   await refresh();
 }
 
@@ -245,7 +270,11 @@ function handleError(error) {
 }
 
 function showLogin(reason = "") {
-  setKey(null);
+  apiKey = null;
+  refreshSeq++;
+  openEventId = null;
+  $("event-detail").hidden = true;
+  deadWanted = DEAD_PAGE_SIZE;
   clearInterval(refreshTimer);
   refreshTimer = null;
   $("dashboard").hidden = true;
@@ -269,7 +298,7 @@ function showDashboard() {
 document.addEventListener("DOMContentLoaded", () => {
   $("login").addEventListener("submit", (e) => {
     e.preventDefault();
-    setKey($("api-key").value.trim());
+    apiKey = $("api-key").value.trim();
     $("api-key").value = "";
     showDashboard();
   });
@@ -282,7 +311,9 @@ document.addEventListener("DOMContentLoaded", () => {
     openEventId = null;
     $("event-detail").hidden = true;
   });
-  memoryKey = getKey();
-  if (memoryKey) showDashboard();
-  else showLogin();
+  $("dead-more").addEventListener("click", () => {
+    deadWanted += DEAD_PAGE_SIZE;
+    refresh();
+  });
+  showLogin();
 });

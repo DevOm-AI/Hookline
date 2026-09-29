@@ -114,6 +114,7 @@ button {
 }
 button.secondary { background: transparent; color: var(--accent); }
 button.link { padding: 0; border: 0; background: none; color: var(--accent); }
+button.more { margin-top: 12px; }
 button:disabled { opacity: 0.5; cursor: default; }
 
 #message { margin: 0 0 8px; padding: 8px 12px; border-radius: 6px; background: var(--good-bg); color: var(--good); }

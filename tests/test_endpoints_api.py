@@ -218,6 +218,8 @@ def test_stats_counts_last_24_hours_and_success_rate(client: TestClient, db: Ses
         "deliveries": {"succeeded": 3, "dead": 1, "pending": 1, "in_progress": 1},
         # Unfinished deliveries count for neither side.
         "success_rate": 0.75,
+        # Every dead delivery, old ones included: what replay-dead would replay.
+        "dead_total": 2,
     }
 
 
@@ -228,10 +230,30 @@ def test_stats_include_endpoints_without_finished_deliveries(client: TestClient,
 
     stats = {s["endpoint_id"]: s for s in client.get("/endpoints/stats").json()}
 
-    assert stats[idle] == {"endpoint_id": idle, "deliveries": {}, "success_rate": None}
+    assert stats[idle] == {
+        "endpoint_id": idle,
+        "deliveries": {},
+        "success_rate": None,
+        "dead_total": 0,
+    }
     assert stats[str(waiting.id)]["deliveries"] == {"pending": 1}
     assert stats[str(waiting.id)]["success_rate"] is None
 
 
 def test_stats_route_is_not_taken_for_an_endpoint_id(client: TestClient):
     assert client.get("/endpoints/stats").status_code == 200
+
+
+def test_stats_dead_total_is_per_endpoint(client: TestClient, db: Session):
+    first = db.get(Endpoint, uuid.UUID(create(client)["id"]))
+    second = db.get(Endpoint, uuid.UUID(create(client)["id"]))
+    for _ in range(3):
+        add_delivery(db, first, status=DeliveryStatus.DEAD)
+    add_delivery(db, second, status=DeliveryStatus.DEAD)
+    add_delivery(db, second, status=DeliveryStatus.SUCCEEDED)
+
+    stats = {s["endpoint_id"]: s for s in client.get("/endpoints/stats").json()}
+
+    assert stats[str(first.id)]["dead_total"] == 3
+    assert stats[str(second.id)]["dead_total"] == 1
+    assert stats[str(second.id)]["deliveries"] == {"dead": 1, "succeeded": 1}

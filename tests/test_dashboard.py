@@ -61,3 +61,11 @@ def test_script_never_renders_api_data_as_html():
 
 def test_dashboard_is_not_in_the_api_schema(client: TestClient):
     assert "/dashboard" not in client.get("/openapi.json").json()["paths"]
+
+
+def test_script_keeps_the_api_key_out_of_browser_storage():
+    # Storage outlives the page: another page of this origin in the same tab could read it.
+    script = (DASHBOARD_DIR / "dashboard.js").read_text()
+
+    for storage in ("sessionStorage", "localStorage", "indexedDB", "document.cookie"):
+        assert storage not in script.replace("never in sessionStorage or localStorage", "")

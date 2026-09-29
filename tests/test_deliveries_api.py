@@ -249,3 +249,87 @@ def test_replay_dead_on_paused_endpoint_waits_for_resume(client: TestClient, db:
 
 def test_replay_dead_unknown_endpoint_is_404(client: TestClient):
     assert client.post(f"/endpoints/{uuid.uuid4()}/replay-dead").status_code == 404
+
+
+# --- pagination ---
+
+
+# These tests make several requests. Each one that doesn't commit rolls back what the test
+# only flushed, so the setup is committed first (the outer transaction still undoes it).
+
+
+def pages(client: TestClient, **params) -> list[list[str]]:
+    """Follow X-Next-Cursor to the end; the ids on each page."""
+    result, cursor = [], None
+    while True:
+        response = client.get("/deliveries", params=params | ({"cursor": cursor} if cursor else {}))
+        assert response.status_code == 200, response.text
+        result.append([body["id"] for body in response.json()])
+        cursor = response.headers.get("X-Next-Cursor")
+        if cursor is None:
+            return result
+
+
+def test_pages_cover_every_delivery_once_newest_first(client: TestClient, db: Session):
+    endpoint = add_endpoint(db)
+    deliveries = [add_delivery(db, endpoint, status=DeliveryStatus.DEAD) for _ in range(5)]
+    # Two share a created_at, so the id has to break the tie across a page boundary.
+    for age, delivery in zip([0, 1, 1, 2, 3], deliveries, strict=True):
+        delivery.created_at = now(db) - timedelta(minutes=age)
+    db.commit()
+    expected = [
+        str(d.id) for d in sorted(deliveries, key=lambda d: (d.created_at, d.id), reverse=True)
+    ]
+
+    result = pages(client, status="dead", limit=2)
+
+    assert [len(page) for page in result] == [2, 2, 1]
+    assert [delivery_id for page in result for delivery_id in page] == expected
+
+
+def test_total_count_counts_every_match_not_the_page(client: TestClient, db: Session):
+    endpoint = add_endpoint(db)
+    for _ in range(3):
+        add_delivery(db, endpoint, status=DeliveryStatus.DEAD)
+    add_delivery(db, endpoint)
+    db.commit()
+
+    response = client.get("/deliveries", params={"status": "dead", "limit": 1})
+
+    assert response.headers["X-Total-Count"] == "3"
+    assert "X-Next-Cursor" in response.headers
+    assert client.get("/deliveries").headers["X-Total-Count"] == "4"
+
+
+def test_last_page_has_no_next_cursor(client: TestClient, db: Session):
+    add_delivery(db, add_endpoint(db))
+
+    response = client.get("/deliveries", params={"limit": 1})
+
+    assert len(response.json()) == 1
+    assert "X-Next-Cursor" not in response.headers
+
+
+def test_replays_between_pages_do_not_skip_deliveries(client: TestClient, db: Session):
+    endpoint = add_endpoint(db)
+    deliveries = [dead_delivery(db, endpoint) for _ in range(4)]
+    for age, delivery in enumerate(deliveries):
+        delivery.created_at = now(db) - timedelta(minutes=age)
+    db.commit()
+
+    first = client.get("/deliveries", params={"status": "dead", "limit": 2})
+    # Replaying the first page takes it off the list; an offset would now skip two rows.
+    for body in first.json():
+        client.post(f"/deliveries/{body['id']}/replay")
+    cursor = first.headers["X-Next-Cursor"]
+    second = client.get("/deliveries", params={"status": "dead", "limit": 2, "cursor": cursor})
+
+    assert [body["id"] for body in second.json()] == [str(d.id) for d in deliveries[2:]]
+
+
+@pytest.mark.parametrize("cursor", ["not-base64!", "bm9waXBl", "MjAyNnx4"])
+def test_invalid_cursor_is_422(client: TestClient, cursor: str):
+    response = client.get("/deliveries", params={"cursor": cursor})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid cursor"}

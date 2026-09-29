@@ -64,21 +64,36 @@ def list_endpoints(db: DbSession) -> list[EndpointOut]:
 # Declared before /{endpoint_id}, which would otherwise match "stats" and reject it as a bad id.
 @router.get("/stats")
 def endpoint_stats(db: DbSession) -> list[EndpointStats]:
-    """Per endpoint: deliveries created in the last 24 hours by status, and the success rate."""
-    # One query, so an endpoint created meanwhile can't show up in one half and not the other.
+    """Per endpoint: deliveries created in the last 24 hours by status, the success rate, and
+    how many are dead in all, whatever their age: what replay-dead would replay."""
+    dead_totals = (
+        select(Delivery.endpoint_id, func.count().label("dead_total"))
+        .where(Delivery.status == DeliveryStatus.DEAD)
+        .group_by(Delivery.endpoint_id)
+        .subquery()
+    )
+    # One statement, so an endpoint created meanwhile can't show up in one part and not another.
     rows = db.execute(
-        select(Endpoint.id, Delivery.status, func.count(Delivery.id))
+        select(
+            Endpoint.id,
+            func.coalesce(dead_totals.c.dead_total, 0),
+            Delivery.status,
+            func.count(Delivery.id),
+        )
         .outerjoin(
             Delivery,
             (Delivery.endpoint_id == Endpoint.id)
             & (Delivery.created_at >= func.now() - STATS_WINDOW),
         )
-        .group_by(Endpoint.id, Delivery.status)
+        .outerjoin(dead_totals, dead_totals.c.endpoint_id == Endpoint.id)
+        .group_by(Endpoint.id, dead_totals.c.dead_total, Delivery.status)
         .order_by(Endpoint.id)
     )
     counts: dict[uuid.UUID, StatusCounts] = {}
-    for endpoint_id, delivery_status, count in rows:
+    dead_total: dict[uuid.UUID, int] = {}
+    for endpoint_id, dead, delivery_status, count in rows:
         by_status = counts.setdefault(endpoint_id, {})
+        dead_total[endpoint_id] = dead
         # An endpoint with no deliveries in the window comes back once, with a NULL status.
         if delivery_status is not None:
             by_status[delivery_status] = count
@@ -87,6 +102,7 @@ def endpoint_stats(db: DbSession) -> list[EndpointStats]:
             endpoint_id=endpoint_id,
             deliveries=by_status,
             success_rate=_success_rate(by_status),
+            dead_total=dead_total[endpoint_id],
         )
         for endpoint_id, by_status in counts.items()
     ]

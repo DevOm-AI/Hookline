@@ -122,7 +122,9 @@ last attempt's status code and error, then send them again once the receiver is 
 
 ```bash
 # Newest first. Filter by status and/or endpoint_id; limit defaults to 100 (max 500).
-curl "localhost:8000/deliveries?status=dead" -H "Authorization: Bearer hk_local_dev_key"
+# X-Total-Count gives the number of matches; while more remain, pass X-Next-Cursor
+# back as ?cursor= for the next page.
+curl -i "localhost:8000/deliveries?status=dead" -H "Authorization: Bearer hk_local_dev_key"
 
 # Replay one: back to pending, due now, with a fresh 5 attempts.
 curl -X POST localhost:8000/deliveries/<id>/replay -H "Authorization: Bearer hk_local_dev_key"
@@ -172,13 +174,17 @@ docker compose start worker
 
 http://localhost:8000/dashboard shows the endpoints with their success rate, the
 dead-letter list with each delivery's last error and a Replay button, and recent events.
-Click an event id to see every delivery and attempt. It refreshes every 10 seconds.
+Click an event id to see every delivery and attempt. It refreshes every 10 seconds. Dead
+letters load 100 at a time ("Load more"), and each endpoint's "Replay all N dead" names the
+full count it will replay, old deliveries included, and asks before doing it.
 
-It's a static page (`app/dashboard/`) that calls the JSON API. Enter the API key once; it
-stays in that browser tab (`sessionStorage`) and goes out as a Bearer header, never a
-cookie, so another site can't trigger a replay through your browser. The page is served
-with a strict Content-Security-Policy, and API data is only ever inserted as text, since
-error bodies come from receivers.
+It's a static page (`app/dashboard/`) that calls the JSON API. The API key you enter is
+kept only in the page's memory: not in `sessionStorage`, `localStorage` or a cookie, so no
+other page can read it and reloading asks for it again (a password manager can fill it in).
+It goes out as a Bearer header, which, unlike a cookie, a browser never adds by itself, so
+another site can't trigger a replay through your browser. The page is served with a strict
+Content-Security-Policy, and API data is only ever inserted as text, since error bodies
+come from receivers.
 
 It uses two routes you can call directly as well:
 
@@ -186,8 +192,9 @@ It uses two routes you can call directly as well:
 # Recent events, newest first, with delivery counts by status (limit defaults to 50, max 200)
 curl "localhost:8000/events?limit=20" -H "Authorization: Bearer hk_local_dev_key"
 
-# Per endpoint, deliveries created in the last 24 hours by status, and
-# success_rate = succeeded / (succeeded + dead); null until one has finished.
+# Per endpoint, deliveries created in the last 24 hours by status,
+# success_rate = succeeded / (succeeded + dead) (null until one has finished), and
+# dead_total: every dead delivery of any age, i.e. what replay-dead would replay.
 curl localhost:8000/endpoints/stats -H "Authorization: Bearer hk_local_dev_key"
 ```
 
