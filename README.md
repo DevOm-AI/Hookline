@@ -396,6 +396,50 @@ curl -s -X PATCH localhost:9000/config -H "Content-Type: application/json" \
 other path can't change the config or records. State is in memory in one process, so run a
 single uvicorn worker.
 
+## Load test
+
+[scripts/load_test.py](scripts/load_test.py) finds the highest event rate at which p95
+latency stays under one second. Latency is per event: from when Hookline accepted it
+(`events.created_at`) to when its first delivery attempt reached the
+[mock receiver](#mock-receiver). For each rate, [k6](loadtest/events.js) sends events at that
+rate, the script waits until every accepted event has arrived, then measures. It stops at
+the first rate that misses; a rate also misses if k6 couldn't hold it, a request wasn't
+accepted, or an event never arrived.
+
+```bash
+docker compose up -d && docker compose up -d receiver
+uv run python scripts/load_test.py --rates 50,100,200,400 --duration 30s
+```
+
+k6 runs from the `grafana/k6` image, so nothing needs installing. `--all` runs every rate
+even after a miss. To test another API, pass both `--api-url` (as this script reaches it)
+and `--k6-api-url` (as the k6 container does). Results are also saved to `loadtest/results/`. The events stay in the
+database; the endpoint and receiver state are cleaned up.
+
+### Results
+
+Measured 2026-09-29 on a laptop (Intel i5-7300U, 2 cores / 4 threads, 7 GB RAM) running the
+whole compose stack and k6: the dev API (one uvicorn process with `--reload`), one worker
+(4 processes) and beat. 30 seconds per rate, receiver answering every request at once.
+
+| Rate | Sent | Not sent (k6 dropped) | Delivered | p50 | p95 | p99 | `POST /events` p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 25/s | 751 | 0 | 751 | 769 ms | 1048 ms | 1093 ms | 56 ms |
+| 50/s | 1501 | 0 | 1501 | 970 ms | 1253 ms | 1297 ms | 92 ms |
+| 100/s | 2825 | 175 | 2825 | 11.9 s | 16.0 s | 16.1 s | 2.9 s |
+| 200/s | 2949 | 3052 | 2949 | 14.9 s | 16.6 s | 17.0 s | 12.7 s |
+
+Every accepted event was delivered at every rate, but no rate met p95 under one second:
+
+- **The 1-second scheduler tick sets the floor.** An accepted event waits for the next tick,
+  0–1 s, so the wait alone has a p95 of about 950 ms before anything is sent.
+- **The worker pool sets the ceiling.** A delivery task takes about 49 ms (its database round
+  trips and the POST), and 4 processes finish about 80 a second. Each tick's batch queues
+  behind the one before, which is the rest of the latency at 25–50/s; from 100/s the backlog
+  grows for as long as the test runs.
+- **At 100/s and above the API is saturated too:** `POST /events` slows to seconds and k6
+  can't hold the rate. Every process here shares 2 cores.
+
 ## Tests and lint
 
 Tests run against a real Postgres, in a separate `hookline_test` database that is
