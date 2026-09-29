@@ -13,6 +13,9 @@ dist/
 build/
 *.egg-info/
 
+# Load test output
+loadtest/results/
+
 # Celery
 celerybeat-schedule*
 

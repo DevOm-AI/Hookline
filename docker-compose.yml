@@ -85,6 +85,15 @@ services:
       retries: 3
     restart: unless-stopped
 
+  # Load test driver, run by scripts/load_test.py: docker compose run --rm k6 run ...
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [loadtest]
+    environment:
+      API_URL: http://api:8000
+    volumes:
+      - ./loadtest:/loadtest:ro
+
   postgres:
     image: postgres:16-alpine
     environment:
