@@ -5,8 +5,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
+from app.core.security import hash_api_key
 from app.main import app
 from app.models import Endpoint
+from tests.conftest import TEST_API_KEY
 
 NEW_ENDPOINT = {"url": "https://example.com/hook", "event_types": ["order.shipped"]}
 
@@ -103,6 +105,26 @@ def test_create_normalizes_event_types(client: TestClient):
 )
 def test_create_rejects_invalid_input(client: TestClient, payload: dict):
     assert client.post("/endpoints", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "url", ["http://localhost:9000/hook", "http://10.0.0.5/hook", "http://169.254.169.254/"]
+)
+def test_create_rejects_internal_urls(client: TestClient, url: str):
+    response = client.post("/endpoints", json=NEW_ENDPOINT | {"url": url})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "URL resolves to a private or internal address"}
+    assert client.get("/endpoints").json() == []
+
+
+def test_create_allows_localhost_only_in_debug(client: TestClient):
+    debug = Settings(_env_file=None, api_key_hash=hash_api_key(TEST_API_KEY), debug=True)
+    app.dependency_overrides[get_settings] = lambda: debug
+
+    assert create(client, url="http://localhost:9000/hook")["url"] == "http://localhost:9000/hook"
+    response = client.post("/endpoints", json=NEW_ENDPOINT | {"url": "http://10.0.0.5/hook"})
+    assert response.status_code == 422
 
 
 # --- read ---

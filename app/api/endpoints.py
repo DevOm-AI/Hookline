@@ -1,11 +1,14 @@
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 
 from app.api.deps import DbSession, require_api_key
 from app.api.schemas import EndpointCreate, EndpointCreated, EndpointOut, EndpointUpdate
+from app.core.config import Settings, get_settings
 from app.core.security import generate_endpoint_secret
+from app.core.url_safety import UnsafeURLError, ensure_public_url
 from app.models import Endpoint
 
 router = APIRouter(
@@ -16,9 +19,22 @@ router = APIRouter(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_endpoint(body: EndpointCreate, db: DbSession) -> EndpointCreated:
+def create_endpoint(
+    body: EndpointCreate,
+    db: DbSession,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> EndpointCreated:
+    url = str(body.url)
+    try:
+        # Localhost receivers are only for local development.
+        ensure_public_url(url, allow_loopback=settings.debug)
+    except UnsafeURLError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
     endpoint = Endpoint(
-        url=str(body.url),
+        url=url,
         event_types=body.event_types,
         secret=generate_endpoint_secret(),
     )
