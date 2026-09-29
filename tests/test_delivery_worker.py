@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx2
 import pytest
 from sqlalchemy import delete, func, select, update
+from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core import signing
@@ -163,6 +164,7 @@ def test_every_try_is_signed_with_the_time_it_was_sent(
 def test_secret_stays_out_of_logs():
     outgoing = Outgoing(
         url="https://example.com/hook",
+        endpoint_id=uuid.uuid4(),
         attempt_count=0,
         locked_until=None,
         secret="whsec_do_not_log",
@@ -698,3 +700,92 @@ def test_receiver_failing_twice_gets_the_event_on_the_third_try(
     final = local_receiver.received[-1]
     assert json.loads(final["body"]) == PAYLOAD
     assert verify_signature(SECRET, final["body"], final["headers"]["Hookline-Signature"])
+
+
+# --- endpoint health (feeds auto-pause) ---
+
+
+def endpoint_of(db: Session, delivery: Delivery) -> Endpoint:
+    return db.get(Endpoint, delivery.endpoint_id)
+
+
+def set_failing_since(db: Session, delivery: Delivery, ago: timedelta | None) -> None:
+    endpoint_of(db, delivery).failing_since = None if ago is None else db_now(db) - ago
+    db.flush()
+
+
+@pytest.mark.parametrize("status_code", [500, 404])
+def test_failure_starts_the_endpoints_failing_streak(
+    db: Session, receiver: Receiver, status_code: int
+):
+    delivery = add_delivery(db)
+    receiver.handler = lambda request: httpx2.Response(status_code)
+
+    run(db, delivery)
+
+    assert endpoint_of(db, delivery).failing_since == db_now(db)
+
+
+def test_network_failure_also_counts(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+
+    def refuse(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("refused", request=request)
+
+    receiver.handler = refuse
+
+    run(db, delivery)
+
+    assert endpoint_of(db, delivery).failing_since == db_now(db)
+
+
+def test_later_failures_keep_when_the_streak_began(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+    set_failing_since(db, delivery, timedelta(hours=5))
+    receiver.handler = lambda request: httpx2.Response(503)
+
+    run(db, delivery)
+
+    assert endpoint_of(db, delivery).failing_since == db_now(db) - timedelta(hours=5)
+
+
+def test_success_ends_the_failing_streak(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+    set_failing_since(db, delivery, timedelta(hours=23))
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    assert endpoint_of(db, delivery).failing_since is None
+
+
+def test_healthy_endpoint_is_not_written_on_success(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+    updates = []
+
+    def record(conn, cursor, statement, *args):
+        if statement.lstrip().upper().startswith("UPDATE ENDPOINTS"):
+            updates.append(statement)
+
+    engine = db.get_bind().engine
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        run(db, delivery)
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+
+    # The UPDATE runs but its WHERE matches no row, so nothing is written or locked.
+    assert endpoint_of(db, delivery).failing_since is None
+    assert all("failing_since IS NOT NULL" in statement for statement in updates)
+
+
+def test_dropped_result_does_not_touch_endpoint_health(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+    receiver.handler = set_mid_request(
+        db, delivery, status=DeliveryStatus.PENDING, locked_until=None
+    )
+
+    run(db, delivery)
+
+    assert attempts_for(db, delivery) == []
+    assert endpoint_of(db, delivery).failing_since is None

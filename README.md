@@ -4,6 +4,9 @@
 
 A webhook delivery service that doesn't lose events.
 
+Every accepted event is stored durably. Deliveries are never lost; events that arrive while
+an endpoint is paused can be recovered with `POST /endpoints/{id}/recover`.
+
 > Work in progress. The full README (architecture, design decisions, chaos test results) comes later.
 
 ## Run locally
@@ -47,7 +50,7 @@ curl -X POST localhost:8000/endpoints \
 
 curl localhost:8000/endpoints -H "Authorization: Bearer hk_local_dev_key"
 
-# Pause (or resume with true)
+# Pause (or resume with true). See "Pausing, resuming and recovering" below.
 curl -X PATCH localhost:8000/endpoints/<id> \
   -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
   -d '{"is_active": false}'
@@ -139,6 +142,55 @@ conditional `UPDATE`, so a delivery a worker is sending is never touched and a d
 replays once. Replayed deliveries of a paused endpoint wait as `pending` until it's resumed.
 The receiver gets the same `Hookline-Event-Id` again, so its dedupe still applies.
 
+### Auto-pause
+
+An endpoint that fails every attempt for 24 hours is paused automatically, so workers stop
+spending time on it. The first failed attempt after a success sets the endpoint's
+`failing_since`, and the next success clears it. Once a minute a beat job pauses every
+active endpoint whose `failing_since` is 24 hours old (`is_active = false`, `auto_paused_at`
+set) and logs a warning. Both fields are in `GET /endpoints`, and the dashboard shows the
+endpoint as "failing" (with the time it will be paused) and then "auto-paused".
+
+Resuming clears `failing_since` and `auto_paused_at`, so the endpoint gets a fresh 24 hours.
+
+### Pausing, resuming and recovering
+
+Pausing an endpoint, by hand or automatically, sets its `paused_at`. What happens to its
+events:
+
+- **Deliveries it already has** wait as `pending` and go out when it's resumed. Its dead
+  ones stay dead until replayed.
+- **Events accepted while it's paused** get no delivery for it, so nothing piles up for a
+  receiver that may be gone for good. The events themselves are stored like any other.
+
+Resuming does **not** send the events from the pause: a receiver that has just come back
+may not want a flood. The resume response includes `recover_since`; pass it to `recover`
+when you're ready (you can also recover while still paused, without `since`):
+
+```bash
+curl -X PATCH localhost:8000/endpoints/<id> \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -d '{"is_active": true}'
+# → {..., "is_active": true, "paused_at": null, "recover_since": "2026-09-29T09:37:07Z"}
+
+# Pending deliveries for every event of a subscribed type created since then that has none
+# for this endpoint. Returns {"created": n, "since": ...}.
+curl -X POST "localhost:8000/endpoints/<id>/recover?since=2026-09-29T09:37:07Z" \
+  -H "Authorization: Bearer hk_local_dev_key"
+```
+
+- `since` needs a time zone. Without it, recover uses the endpoint's `paused_at`, so it only
+  works while the endpoint is still paused; otherwise it's a 422. Endpoints paused by hand
+  before `paused_at` existed also need an explicit `since`.
+- The default window, and `recover_since`, starts one minute before `paused_at`, but never
+  before the endpoint was created. That catches an event accepted in a transaction that
+  began just before the pause, whose fan-out ran just after it.
+- Running recover again creates nothing new. Each delivery is unique per (event, endpoint),
+  and the insert is `ON CONFLICT DO NOTHING`, so a concurrent recover or fan-out can't
+  duplicate one either.
+- Deliveries are inserted and committed 1,000 at a time, so a long pause doesn't become one
+  huge transaction. If recover fails partway, run it again: it picks up the rest.
+
 ### Recovering stuck deliveries
 
 If a worker dies mid-send, or a queued task is lost, its delivery would stay `in_progress`
@@ -176,7 +228,8 @@ http://localhost:8000/dashboard shows the endpoints with their success rate, the
 dead-letter list with each delivery's last error and a Replay button, and recent events.
 Click an event id to see every delivery and attempt. It refreshes every 10 seconds. Dead
 letters load 100 at a time ("Load more"), and each endpoint's "Replay all N dead" names the
-full count it will replay, old deliveries included, and asks before doing it.
+full count it will replay, old deliveries included, and asks before doing it. Paused
+endpoints get a Resume button.
 
 It's a static page (`app/dashboard/`) that calls the JSON API. The API key you enter is
 kept only in the page's memory: not in `sessionStorage`, `localStorage` or a cookie, so no
