@@ -65,6 +65,14 @@ curl -X POST localhost:8000/events \
   -d '{"type": "order.shipped", "payload": {"order_id": 42}}'
 ```
 
+## Delivery
+
+Every second, the `beat` service triggers a job that claims up to 100 due deliveries
+(`pending`, `next_attempt_at` passed, endpoint active) with `FOR UPDATE SKIP LOCKED`.
+It marks them `in_progress` for 60 seconds, commits, and only then queues them for the
+workers. Several schedulers can run at once without claiming the same delivery. Deliveries
+for a paused endpoint wait as `pending` until it's resumed.
+
 ## Migrations
 
 Run Alembic inside a container, where `DATABASE_URL` points at the `postgres` service:
