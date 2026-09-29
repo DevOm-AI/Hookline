@@ -455,7 +455,9 @@ EVENTS=1000 scripts/chaos_test.sh      # a quicker run
 ```
 
 `WORKERS`, `KILL_EVERY`, `RATE` and `FAIL_PERCENT` can be set the same way. It exits 1 if
-any event was lost, and leaves the stack running with one worker.
+any event was lost, and also if the load fell short (k6 dropped requests, the API refused
+some, or fewer than `EVENTS` were accepted), since zero lost then proves little. It leaves
+the stack running with one worker, and exits 1 if it can't.
 
 At 20% failures, about 16 in 10,000 events fail four times in a row, and their fifth try is
 30 minutes later; a few fail that too and go dead. Rather than wait, the test lets retries run

@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
-from scripts.chaos import ChaosResult
+import pytest
+
+from scripts.chaos import ChaosResult, shortfalls
 
 T0 = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
 
@@ -57,3 +59,29 @@ def test_nothing_sent():
         None,
         None,
     )
+
+
+K6 = {"rate": 50, "requests": 2, "accepted": 2, "dropped": 0, "post_p95_ms": 50.0}
+DELIVERED = {"a": record(100), "b": record(100)}
+
+
+def test_a_full_run_with_nothing_lost_has_no_shortfalls():
+    result = ChaosResult.measure({"a": T0, "b": T0}, DELIVERED)
+
+    assert shortfalls(result, K6, events_requested=2) == []
+
+
+@pytest.mark.parametrize(
+    ("k6", "created", "expected"),
+    [
+        (K6 | {"dropped": 3}, {"a": T0, "b": T0}, "k6 dropped 3 requests"),
+        (K6 | {"requests": 3}, {"a": T0, "b": T0}, "The API accepted 2 of 3 requests"),
+        (K6 | {"requests": 0, "accepted": 0}, {}, "Only 0 of 2 events were accepted"),
+        (K6, {"a": T0, "b": T0, "c": T0}, "1 events were lost"),
+    ],
+)
+def test_a_run_that_fell_short_fails(k6: dict, created: dict, expected: str):
+    """Zero lost proves little if the requested load never happened."""
+    result = ChaosResult.measure(created, DELIVERED)
+
+    assert any(problem.startswith(expected) for problem in shortfalls(result, k6, 2))

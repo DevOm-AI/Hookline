@@ -8,7 +8,8 @@
    changes when those events go out, not whether: every one of them is still in Postgres.
 5. Compares the event ids the receiver got with the events Hookline accepted.
 
-Exits 1 if any event was lost.
+Exits 1 if any event was lost, or if the load didn't happen as asked: k6 dropped requests,
+the API refused some, or fewer than --events were accepted.
 """
 
 import argparse
@@ -77,6 +78,24 @@ class ChaosResult:
             p99_ms=stats[2],
             all_attempted_after_s=all_attempted_after_s,
         )
+
+
+def shortfalls(result: ChaosResult, k6: dict, events_requested: int) -> list[str]:
+    """Why this run didn't test what it set out to, if it didn't.
+
+    Zero lost proves little if the load never happened: every requested event must have been
+    sent and accepted, and every accepted one delivered.
+    """
+    problems = []
+    if k6["dropped"]:
+        problems.append(f"k6 dropped {k6['dropped']} requests: the rate wasn't held")
+    if k6["accepted"] < k6["requests"]:
+        problems.append(f"The API accepted {k6['accepted']} of {k6['requests']} requests")
+    if result.sent < events_requested:
+        problems.append(f"Only {result.sent} of {events_requested} events were accepted")
+    if result.lost:
+        problems.append(f"{result.lost} events were lost")
+    return problems
 
 
 def delivery_states(database_url: str, endpoint_id: str) -> dict[str, int]:
@@ -224,10 +243,10 @@ Settled:                 {made_due} retries made due, {replayed} dead replayed""
     path.write_text(json.dumps(report, indent=2, default=str))
     print(f"Saved {path.relative_to(ROOT)}")
 
-    if failures:
-        print("\n".join(failures), file=sys.stderr)
-    if result.lost or failures:
-        sys.exit(1)
+    problems = shortfalls(result, k6, args.events) + failures
+    if problems:
+        sys.exit("\nFAILED:\n" + "\n".join(problems))
+    print("\nPASSED: every event sent was accepted and delivered.")
 
 
 if __name__ == "__main__":

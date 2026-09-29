@@ -8,7 +8,8 @@
 #   EVENTS=1000 scripts/chaos_test.sh            # a quicker one
 #
 # Needs ALLOWED_INTERNAL_HOSTS=receiver:9000 in .env (see .env.example). Leaves the stack
-# running with one worker again. Exits 1 if any event was lost.
+# running with one worker again. Exits 1 if any event was lost, the load fell short, or the
+# workers couldn't be restored.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,14 +25,22 @@ kill_log=$(mktemp)
 killer_pid=
 
 finish() {
+  local status=$?
   if [ -n "$killer_pid" ]; then
     kill "$killer_pid" 2>/dev/null || true
     wait "$killer_pid" 2>/dev/null || true
   fi
-  echo "Restarting any stopped workers, then back to one..."
-  docker compose up -d --scale "worker=$WORKERS" worker >/dev/null 2>&1 || true
-  docker compose up -d --scale worker=1 worker >/dev/null 2>&1 || true
   rm -f "$kill_log"
+  # Starts the one worker kept, even if it was the last one killed, and removes the rest.
+  echo "Back to one worker..."
+  local running
+  if ! docker compose up -d --scale worker=1 worker >/dev/null \
+    || ! running=$(docker compose ps -q --status running worker | wc -l) \
+    || [ "$running" -ne 1 ]; then
+    echo "Couldn't restore the workers (${running:-?} running): check docker compose ps" >&2
+    status=1
+  fi
+  exit "$status"
 }
 trap finish EXIT
 
