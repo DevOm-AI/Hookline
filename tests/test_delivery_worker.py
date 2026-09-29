@@ -130,6 +130,64 @@ def test_connects_to_the_checked_address_under_the_original_name(db: Session, re
     assert request.extensions["sni_hostname"] == "example.com"
 
 
+def test_falls_back_to_the_next_address_when_one_is_unreachable(
+    db: Session, receiver: Receiver, dns: dict[str, list[str]]
+):
+    """E.g. a host with an IPv6 address the worker's network can't reach."""
+    dns["example.com"] = ["2606:2800:21f:cb07:6820:80da:af6b:8b2c", "93.184.215.14"]
+
+    def ipv4_only(request: httpx2.Request) -> httpx2.Response:
+        if request.url.host != "93.184.215.14":
+            raise httpx2.ConnectError("network unreachable")
+        return httpx2.Response(200)
+
+    receiver.handler = ipv4_only
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert [r.url.host for r in receiver.requests] == [
+        "2606:2800:21f:cb07:6820:80da:af6b:8b2c",
+        "93.184.215.14",
+    ]
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    assert len(attempts_for(db, delivery)) == 1
+
+
+def test_fails_when_every_address_is_unreachable(
+    db: Session, receiver: Receiver, dns: dict[str, list[str]]
+):
+    dns["example.com"] = ["93.184.215.14", "93.184.215.15"]
+
+    def refuse(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError(f"refused by {request.url.host}")
+
+    receiver.handler = refuse
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert len(receiver.requests) == 2
+    assert delivery.status == DeliveryStatus.DEAD
+    [attempt] = attempts_for(db, delivery)
+    assert attempt.status_code is None
+    assert attempt.error == "ConnectError: refused by 93.184.215.15"
+
+
+def test_a_response_from_one_address_is_final(
+    db: Session, receiver: Receiver, dns: dict[str, list[str]]
+):
+    """Only connection failures move on to the next address, never an answer or a timeout."""
+    dns["example.com"] = ["93.184.215.14", "93.184.215.15"]
+    receiver.handler = lambda request: httpx2.Response(503)
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert len(receiver.requests) == 1
+    assert delivery.status == DeliveryStatus.DEAD
+
+
 @pytest.mark.parametrize("status_code", [400, 404, 429, 500, 503])
 def test_non_2xx_marks_delivery_dead_with_the_response(
     db: Session, receiver: Receiver, status_code: int

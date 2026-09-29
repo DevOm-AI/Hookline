@@ -10,7 +10,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.core.url_safety import UnsafeURLError, resolve_public_address
+from app.core.url_safety import UnsafeURLError, resolve_public_addresses
 from app.models import Delivery, DeliveryAttempt, DeliveryStatus
 from app.workers.celery_app import celery_app
 
@@ -108,48 +108,57 @@ def _post(outgoing: Outgoing) -> AttemptResult:
         return round((time.monotonic() - started) * 1000)
 
     try:
-        url, headers["Host"], extensions = _pin_address(outgoing.url)
+        urls, headers["Host"], extensions = _pin_addresses(outgoing.url)
         # No redirects: a 3xx could point anywhere, including internal addresses.
         # No trust_env: an HTTP(S)_PROXY from the environment would bypass the pinned address.
-        with (
-            httpx2.Client(
-                transport=_transport,
-                timeout=REQUEST_TIMEOUT,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client,
-            client.stream(
-                "POST", url, content=outgoing.body, headers=headers, extensions=extensions
-            ) as response,
-        ):
-            response_ms = elapsed_ms()
-            if 200 <= response.status_code < 300:
-                return AttemptResult(response.status_code, response_ms, None)
-            return AttemptResult(response.status_code, response_ms, _error_body(response))
+        with httpx2.Client(
+            transport=_transport,
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            for index, url in enumerate(urls):
+                try:
+                    with client.stream(
+                        "POST", url, content=outgoing.body, headers=headers, extensions=extensions
+                    ) as response:
+                        response_ms = elapsed_ms()
+                        if 200 <= response.status_code < 300:
+                            return AttemptResult(response.status_code, response_ms, None)
+                        return AttemptResult(
+                            response.status_code, response_ms, _error_body(response)
+                        )
+                except httpx2.ConnectError:
+                    # Refused or unreachable (e.g. a host's IPv6 address on an IPv4-only
+                    # network): try its next checked address, as any HTTP client would.
+                    if index == len(urls) - 1:
+                        raise
     except UnsafeURLError as exc:
         return AttemptResult(None, elapsed_ms(), f"Blocked: {exc}")
     except httpx2.TimeoutException:
         return AttemptResult(None, elapsed_ms(), f"Timed out after {REQUEST_TIMEOUT:g}s")
     except httpx2.HTTPError as exc:
         return AttemptResult(None, elapsed_ms(), f"{type(exc).__name__}: {exc}"[:500])
+    raise AssertionError("unreachable: resolve_public_addresses never returns an empty list")
 
 
-def _pin_address(raw_url: str) -> tuple[httpx2.URL, str, dict[str, str]]:
-    """Resolve and check the host now, then connect to exactly that address.
+def _pin_addresses(raw_url: str) -> tuple[list[httpx2.URL], str, dict[str, str]]:
+    """Resolve and check the host now, then connect only to the addresses checked.
 
-    Returns the URL with the host swapped for the checked IP, the Host header value and the
-    request extensions (TLS SNI).
+    Returns one URL per address, with the host swapped for that IP, plus the Host header value
+    and the request extensions (TLS SNI).
 
     Checking the name and letting the HTTP client resolve it again would leave a gap for DNS
     rebinding: the second lookup could return an internal address. The original host still
     goes in the Host header and in TLS SNI, so virtual hosts and certificate checks work.
     """
     url = httpx2.URL(raw_url)
-    address = resolve_public_address(raw_url, allow_loopback=get_settings().debug)
+    addresses = resolve_public_addresses(raw_url, allow_loopback=get_settings().debug)
     # raw_host: the ASCII (punycode) form a TLS handshake needs.
     sni = url.raw_host.decode("ascii")
     extensions = {"sni_hostname": sni} if url.scheme == "https" else {}
-    return url.copy_with(host=str(address)), url.netloc.decode("ascii"), extensions
+    urls = [url.copy_with(host=str(address)) for address in addresses]
+    return urls, url.netloc.decode("ascii"), extensions
 
 
 def _error_body(response: httpx2.Response) -> str:
