@@ -1,8 +1,11 @@
+import base64
+import binascii
 import uuid
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import ColumnElement, Row, Select, Update, func, select, true, update
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import ColumnElement, Row, Select, Update, func, select, true, tuple_, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import DbSession, require_api_key
@@ -19,18 +22,55 @@ router = APIRouter(
 @router.get("")
 def list_deliveries(
     db: DbSession,
+    response: Response,
     status_: Annotated[DeliveryStatus | None, Query(alias="status")] = None,
     endpoint_id: uuid.UUID | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    cursor: Annotated[
+        str | None, Query(description="X-Next-Cursor from the previous page.")
+    ] = None,
 ) -> list[DeliveryOut]:
-    """Newest first, each with its last attempt. `?status=dead` is the dead-letter list."""
-    query = _with_last_attempt(select(Delivery))
+    """Newest first, each with its last attempt. `?status=dead` is the dead-letter list.
+
+    X-Total-Count is how many match the filters in all. While more pages remain,
+    X-Next-Cursor is set: pass it as `cursor` to get the next one.
+    """
+    filters = []
     if status_ is not None:
-        query = query.where(Delivery.status == status_)
+        filters.append(Delivery.status == status_)
     if endpoint_id is not None:
-        query = query.where(Delivery.endpoint_id == endpoint_id)
-    rows = db.execute(query.order_by(Delivery.created_at.desc(), Delivery.id).limit(limit))
+        filters.append(Delivery.endpoint_id == endpoint_id)
+    response.headers["X-Total-Count"] = str(
+        db.scalar(select(func.count()).select_from(Delivery).where(*filters))
+    )
+
+    query = _with_last_attempt(select(Delivery)).where(*filters)
+    if cursor is not None:
+        # Keyset, not offset: replays taking rows off the list don't shift the next page.
+        query = query.where(tuple_(Delivery.created_at, Delivery.id) < _decode_cursor(cursor))
+    rows = db.execute(
+        query.order_by(Delivery.created_at.desc(), Delivery.id.desc()).limit(limit + 1)
+    ).all()
+    # One row past the page tells whether there's another page, without a second count.
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1][0]
+        response.headers["X-Next-Cursor"] = _encode_cursor(last.created_at, last.id)
     return [_to_out(row) for row in rows]
+
+
+def _encode_cursor(created_at: datetime, delivery_id: uuid.UUID) -> str:
+    return base64.urlsafe_b64encode(f"{created_at.isoformat()}|{delivery_id}".encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        created_at, delivery_id = base64.urlsafe_b64decode(cursor).decode().split("|")
+        return datetime.fromisoformat(created_at), uuid.UUID(delivery_id)
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid cursor"
+        ) from exc
 
 
 @router.post("/{delivery_id}/replay")

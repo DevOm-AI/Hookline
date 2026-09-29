@@ -2,6 +2,8 @@ import logging
 
 from fastapi import FastAPI
 
+from app.api.dashboard import router as dashboard_router
+from app.api.dashboard import static_files as dashboard_static
 from app.api.deliveries import router as deliveries_router
 from app.api.endpoints import router as endpoints_router
 from app.api.events import router as events_router
@@ -21,6 +23,8 @@ def create_app() -> FastAPI:
     app.include_router(endpoints_router)
     app.include_router(events_router)
     app.include_router(deliveries_router)
+    app.include_router(dashboard_router)
+    app.mount("/dashboard/static", dashboard_static, name="dashboard-static")
     return app
 
 

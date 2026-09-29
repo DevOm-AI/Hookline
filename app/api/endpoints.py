@@ -1,8 +1,9 @@
 import uuid
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deliveries import replay_dead
 from app.api.deps import DbSession, require_api_key
@@ -10,19 +11,23 @@ from app.api.schemas import (
     EndpointCreate,
     EndpointCreated,
     EndpointOut,
+    EndpointStats,
     EndpointUpdate,
     ReplayedDeliveries,
+    StatusCounts,
 )
 from app.core.config import Settings, get_settings
 from app.core.security import generate_endpoint_secret
 from app.core.url_safety import UnsafeURLError, ensure_public_url
-from app.models import Delivery, Endpoint
+from app.models import Delivery, DeliveryStatus, Endpoint
 
 router = APIRouter(
     prefix="/endpoints",
     tags=["endpoints"],
     dependencies=[Depends(require_api_key)],
 )
+
+STATS_WINDOW = timedelta(hours=24)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -54,6 +59,60 @@ def create_endpoint(
 def list_endpoints(db: DbSession) -> list[EndpointOut]:
     endpoints = db.scalars(select(Endpoint).order_by(Endpoint.created_at.desc(), Endpoint.id))
     return [EndpointOut.model_validate(endpoint) for endpoint in endpoints]
+
+
+# Declared before /{endpoint_id}, which would otherwise match "stats" and reject it as a bad id.
+@router.get("/stats")
+def endpoint_stats(db: DbSession) -> list[EndpointStats]:
+    """Per endpoint: deliveries created in the last 24 hours by status, the success rate, and
+    how many are dead in all, whatever their age: what replay-dead would replay."""
+    dead_totals = (
+        select(Delivery.endpoint_id, func.count().label("dead_total"))
+        .where(Delivery.status == DeliveryStatus.DEAD)
+        .group_by(Delivery.endpoint_id)
+        .subquery()
+    )
+    # One statement, so an endpoint created meanwhile can't show up in one part and not another.
+    rows = db.execute(
+        select(
+            Endpoint.id,
+            func.coalesce(dead_totals.c.dead_total, 0),
+            Delivery.status,
+            func.count(Delivery.id),
+        )
+        .outerjoin(
+            Delivery,
+            (Delivery.endpoint_id == Endpoint.id)
+            & (Delivery.created_at >= func.now() - STATS_WINDOW),
+        )
+        .outerjoin(dead_totals, dead_totals.c.endpoint_id == Endpoint.id)
+        .group_by(Endpoint.id, dead_totals.c.dead_total, Delivery.status)
+        .order_by(Endpoint.id)
+    )
+    counts: dict[uuid.UUID, StatusCounts] = {}
+    dead_total: dict[uuid.UUID, int] = {}
+    for endpoint_id, dead, delivery_status, count in rows:
+        by_status = counts.setdefault(endpoint_id, {})
+        dead_total[endpoint_id] = dead
+        # An endpoint with no deliveries in the window comes back once, with a NULL status.
+        if delivery_status is not None:
+            by_status[delivery_status] = count
+    return [
+        EndpointStats(
+            endpoint_id=endpoint_id,
+            deliveries=by_status,
+            success_rate=_success_rate(by_status),
+            dead_total=dead_total[endpoint_id],
+        )
+        for endpoint_id, by_status in counts.items()
+    ]
+
+
+def _success_rate(by_status: StatusCounts) -> float | None:
+    # Pending and in-progress deliveries haven't finished, so they count for neither side.
+    succeeded = by_status.get(DeliveryStatus.SUCCEEDED, 0)
+    finished = succeeded + by_status.get(DeliveryStatus.DEAD, 0)
+    return succeeded / finished if finished else None
 
 
 @router.get("/{endpoint_id}")
