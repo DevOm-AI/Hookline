@@ -16,6 +16,7 @@ docker compose up --build
 ```
 
 API docs: http://localhost:8000/docs
+Dashboard: http://localhost:8000/dashboard
 Health check: http://localhost:8000/health
 
 Migrations run automatically: the `migrate` service applies `alembic upgrade head`
@@ -165,6 +166,29 @@ the worker while it is sending, then start it again:
 ```bash
 docker compose kill -s SIGKILL worker
 docker compose start worker
+```
+
+## Dashboard
+
+http://localhost:8000/dashboard shows the endpoints with their success rate, the
+dead-letter list with each delivery's last error and a Replay button, and recent events.
+Click an event id to see every delivery and attempt. It refreshes every 10 seconds.
+
+It's a static page (`app/dashboard/`) that calls the JSON API. Enter the API key once; it
+stays in that browser tab (`sessionStorage`) and goes out as a Bearer header, never a
+cookie, so another site can't trigger a replay through your browser. The page is served
+with a strict Content-Security-Policy, and API data is only ever inserted as text, since
+error bodies come from receivers.
+
+It uses two routes you can call directly as well:
+
+```bash
+# Recent events, newest first, with delivery counts by status (limit defaults to 50, max 200)
+curl "localhost:8000/events?limit=20" -H "Authorization: Bearer hk_local_dev_key"
+
+# Per endpoint, deliveries created in the last 24 hours by status, and
+# success_rate = succeeded / (succeeded + dead); null until one has finished.
+curl localhost:8000/endpoints/stats -H "Authorization: Bearer hk_local_dev_key"
 ```
 
 ## At-least-once delivery

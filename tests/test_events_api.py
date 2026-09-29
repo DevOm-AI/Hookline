@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.api import events as events_api
 from app.models import Delivery, DeliveryStatus, Endpoint, Event
-from tests.test_deliveries_api import add_attempt, dead_delivery
+from tests.test_deliveries_api import add_attempt, dead_delivery, now
 
 EVENT = {"type": "order.shipped", "payload": {"order_id": 42}}
 
@@ -241,3 +241,41 @@ def test_get_event_requires_api_key(client: TestClient):
     del client.headers["Authorization"]
 
     assert client.get(f"/events/{uuid.uuid4()}").status_code == 401
+
+
+# --- list ---
+
+
+def test_list_events_newest_first_with_delivery_counts(client: TestClient, db: Session):
+    add_endpoint(db, ["order.shipped"])
+    add_endpoint(db, ["order.shipped"])
+    older = post_event(client).json()["id"]
+    newer = post_event(client).json()["id"]
+    lonely = post_event(client, type="nobody.listens").json()["id"]
+    for age, event_id in enumerate([lonely, newer, older]):
+        db.get(Event, uuid.UUID(event_id)).created_at = now(db) - timedelta(minutes=age)
+    dead, _ = deliveries_for(db, older)
+    dead.status = DeliveryStatus.DEAD
+    db.flush()
+
+    response = client.get("/events")
+
+    assert response.status_code == 200
+    assert [(e["id"], e["deliveries"]) for e in response.json()] == [
+        (lonely, {}),
+        (newer, {"pending": 2}),
+        (older, {"pending": 1, "dead": 1}),
+    ]
+    assert set(response.json()[0]) == {"id", "type", "created_at", "deliveries"}
+
+
+def test_list_events_respects_limit(client: TestClient):
+    for _ in range(3):
+        post_event(client)
+
+    assert len(client.get("/events", params={"limit": 2}).json()) == 2
+
+
+@pytest.mark.parametrize("limit", [0, 201, "many"])
+def test_list_events_rejects_bad_limit(client: TestClient, limit):
+    assert client.get("/events", params={"limit": limit}).status_code == 422

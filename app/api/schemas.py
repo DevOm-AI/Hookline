@@ -88,6 +88,14 @@ class EventDeliveryOut(BaseModel):
     attempts: list[AttemptOut] = Field(description="Every attempt, oldest first, replays included.")
 
 
+# Delivery counts by status. Statuses with no deliveries are left out.
+StatusCounts = dict[DeliveryStatus, int]
+
+
+class EventSummary(EventAccepted):
+    deliveries: StatusCounts
+
+
 class EventOut(EventAccepted):
     payload: dict[str, Any]
     idempotency_key: str
@@ -112,3 +120,11 @@ class DeliveryOut(BaseModel):
 
 class ReplayedDeliveries(BaseModel):
     replayed: int = Field(description="How many dead deliveries were set back to pending.")
+
+
+class EndpointStats(BaseModel):
+    endpoint_id: uuid.UUID
+    deliveries: StatusCounts = Field(description="Deliveries created in the window, by status.")
+    success_rate: float | None = Field(
+        description="succeeded / (succeeded + dead) in the window; None if none has finished."
+    )

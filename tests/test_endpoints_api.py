@@ -1,14 +1,17 @@
 import uuid
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.security import hash_api_key
 from app.main import app
-from app.models import Endpoint
+from app.models import DeliveryStatus, Endpoint
 from tests.conftest import TEST_API_KEY
+from tests.test_scheduler import add_delivery
 
 NEW_ENDPOINT = {"url": "https://example.com/hook", "event_types": ["order.shipped"]}
 
@@ -18,6 +21,8 @@ ROUTES = [
     ("GET", f"/endpoints/{uuid.uuid4()}"),
     ("PATCH", f"/endpoints/{uuid.uuid4()}"),
     ("DELETE", f"/endpoints/{uuid.uuid4()}"),
+    ("GET", "/endpoints/stats"),
+    ("GET", "/events"),
 ]
 
 
@@ -192,3 +197,41 @@ def test_delete_removes_endpoint(client: TestClient):
 
 def test_delete_unknown_endpoint_is_404(client: TestClient):
     assert client.delete(f"/endpoints/{uuid.uuid4()}").status_code == 404
+
+
+# --- stats ---
+
+
+def test_stats_counts_last_24_hours_and_success_rate(client: TestClient, db: Session):
+    endpoint = db.get(Endpoint, uuid.UUID(create(client)["id"]))
+    for status in ["succeeded"] * 3 + ["dead", "pending", "in_progress"]:
+        add_delivery(db, endpoint, status=DeliveryStatus(status))
+    # Older than the window: not counted.
+    old = add_delivery(db, endpoint, status=DeliveryStatus.DEAD)
+    old.created_at = db.scalar(select(func.now())) - timedelta(hours=25)
+    db.flush()
+
+    [stats] = client.get("/endpoints/stats").json()
+
+    assert stats == {
+        "endpoint_id": str(endpoint.id),
+        "deliveries": {"succeeded": 3, "dead": 1, "pending": 1, "in_progress": 1},
+        # Unfinished deliveries count for neither side.
+        "success_rate": 0.75,
+    }
+
+
+def test_stats_include_endpoints_without_finished_deliveries(client: TestClient, db: Session):
+    idle = create(client)["id"]
+    waiting = db.get(Endpoint, uuid.UUID(create(client)["id"]))
+    add_delivery(db, waiting)
+
+    stats = {s["endpoint_id"]: s for s in client.get("/endpoints/stats").json()}
+
+    assert stats[idle] == {"endpoint_id": idle, "deliveries": {}, "success_rate": None}
+    assert stats[str(waiting.id)]["deliveries"] == {"pending": 1}
+    assert stats[str(waiting.id)]["success_rate"] is None
+
+
+def test_stats_route_is_not_taken_for_an_endpoint_id(client: TestClient):
+    assert client.get("/endpoints/stats").status_code == 200

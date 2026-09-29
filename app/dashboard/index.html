@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hookline</title>
+  <link rel="stylesheet" href="/dashboard/static/dashboard.css">
+  <script src="/dashboard/static/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Hookline</h1>
+    <div id="toolbar" hidden>
+      <span id="updated" class="muted"></span>
+      <button id="refresh" type="button">Refresh</button>
+      <button id="forget" type="button" class="secondary">Forget key</button>
+    </div>
+  </header>
+
+  <main>
+    <p id="message" role="status" hidden></p>
+
+    <!-- The page holds no data itself: everything comes from the API, with this key. -->
+    <form id="login" hidden>
+      <label for="api-key">API key</label>
+      <input id="api-key" type="password" autocomplete="off" required>
+      <button type="submit">Open dashboard</button>
+      <p class="muted">Kept in this tab only (sessionStorage) and sent as a Bearer token.</p>
+    </form>
+
+    <div id="dashboard" hidden>
+      <section>
+        <h2>Endpoints</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>URL</th><th>Event types</th><th>State</th>
+              <th class="num" title="succeeded / (succeeded + dead), deliveries created in the last 24 hours">Success (24 h)</th>
+              <th class="num">Succeeded</th><th class="num">Dead</th><th class="num">Waiting</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="endpoints"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Dead letters <span id="dead-count" class="muted"></span></h2>
+        <table>
+          <thead>
+            <tr><th>Created</th><th>Endpoint</th><th>Event</th><th class="num">Attempts</th><th>Last error</th><th></th></tr>
+          </thead>
+          <tbody id="dead"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Recent events</h2>
+        <table>
+          <thead>
+            <tr><th>Created</th><th>Type</th><th>Event</th><th>Deliveries</th></tr>
+          </thead>
+          <tbody id="events"></tbody>
+        </table>
+      </section>
+
+      <section id="event-detail" hidden>
+        <h2>Event <code id="detail-id"></code> <button id="detail-close" type="button" class="secondary">Close</button></h2>
+        <p><span id="detail-type"></span> <span id="detail-created" class="muted"></span></p>
+        <pre id="detail-payload"></pre>
+        <div id="detail-deliveries"></div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
