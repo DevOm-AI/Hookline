@@ -114,6 +114,12 @@ forever. Every 30 seconds a sweeper job sets `in_progress` deliveries whose 60-s
 has expired back to `pending`, and the scheduler claims them again on its next tick.
 Postgres, not Redis, is what guarantees the work gets done.
 
+A worker saves its result only if it still holds the delivery: the row must still be
+`in_progress` with the same `locked_until` its claim set (every claim sets a new one). If a
+slow request outlived the lock and the delivery has since been released, claimed by another
+worker or settled, that update changes 0 rows and the stale result is dropped, so it never
+overwrites the current owner's. A lock that expired with nobody taking over still counts.
+
 ## At-least-once delivery
 
 Hookline delivers every event **at least once**, not exactly once. Your receiver can get the

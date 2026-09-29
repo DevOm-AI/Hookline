@@ -4,7 +4,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import httpx2
 from sqlalchemy import func, select, update
@@ -51,6 +51,9 @@ class Outgoing:
     url: str
     # Attempts made before this one.
     attempt_count: int
+    # The lock as this worker's claim set it. Every claim sets a new one, so it identifies the
+    # claim: if it has changed by the time the result is saved, the delivery isn't ours.
+    locked_until: datetime | None
     # repr=False keeps the secret out of logs and tracebacks.
     secret: str = field(repr=False)
     event_id: uuid.UUID
@@ -89,7 +92,7 @@ def send_delivery(delivery_id: uuid.UUID) -> None:
     result = _post(outgoing)
     # A crash here, after the receiver got the request but before the result is saved, means
     # the sweeper hands the delivery back and it is sent again: at-least-once, not exactly-once.
-    _record(delivery_id, outgoing.attempt_count + 1, result)
+    _record(delivery_id, outgoing, result)
 
 
 def _load(delivery_id: uuid.UUID) -> Outgoing | None:
@@ -120,6 +123,7 @@ def _load(delivery_id: uuid.UUID) -> Outgoing | None:
         return Outgoing(
             url=delivery.endpoint.url,
             attempt_count=delivery.attempt_count,
+            locked_until=delivery.locked_until,
             secret=delivery.endpoint.secret,
             event_id=delivery.event.id,
             event_type=delivery.event.type,
@@ -223,8 +227,14 @@ def retry_delay(attempt: int) -> timedelta:
     return RETRY_DELAYS[attempt - 1] * random.uniform(1 - JITTER, 1 + JITTER)
 
 
-def _record(delivery_id: uuid.UUID, attempt: int, result: AttemptResult) -> None:
-    """Log the attempt and move the delivery on: succeeded, pending for a retry, or dead."""
+def _record(delivery_id: uuid.UUID, outgoing: Outgoing, result: AttemptResult) -> None:
+    """Log the attempt and move the delivery on: succeeded, pending for a retry, or dead.
+
+    Only while this worker still holds the delivery. If the request outlived the lock, the
+    sweeper may have handed it back and another worker may own it now; saving this result
+    would overwrite theirs.
+    """
+    attempt = outgoing.attempt_count + 1
     values: dict = {"attempt_count": attempt, "locked_until": None}
     if result.succeeded:
         values["status"] = DeliveryStatus.SUCCEEDED
@@ -241,10 +251,25 @@ def _record(delivery_id: uuid.UUID, attempt: int, result: AttemptResult) -> None
         outcome = "dead" if result.retryable else "dead (not retryable)"
 
     with SessionLocal() as db:
-        updated = db.execute(update(Delivery).where(Delivery.id == delivery_id).values(**values))
+        updated = db.execute(
+            update(Delivery)
+            .where(
+                Delivery.id == delivery_id,
+                Delivery.status == DeliveryStatus.IN_PROGRESS,
+                # Still our claim. An expired lock nobody has taken over yet still counts.
+                Delivery.locked_until.is_not_distinct_from(outgoing.locked_until),
+            )
+            .values(**values)
+        )
         if updated.rowcount == 0:
-            # Deleted with its endpoint or event while the request was in flight.
-            logger.info("Delivery %s was deleted during the attempt; not recorded", delivery_id)
+            # Released by the sweeper, claimed again or settled by another worker, or deleted
+            # with its endpoint or event. Whoever has it now decides; this result is dropped.
+            logger.warning(
+                "Delivery %s is no longer held by this worker; attempt %d (%s) not recorded",
+                delivery_id,
+                attempt,
+                result.error or result.status_code,
+            )
             return
         db.add(
             DeliveryAttempt(
