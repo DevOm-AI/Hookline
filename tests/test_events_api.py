@@ -103,8 +103,12 @@ def test_same_idempotency_key_returns_original_and_creates_nothing(client: TestC
     assert db.get(Event, uuid.UUID(first.json()["id"])).payload == {"order_id": 42}
 
 
-def wait_for_insert_blocked_on_a_lock(engine: Engine, timeout: float = 5.0) -> None:
-    """Return once another connection's INSERT INTO events is waiting on a row lock."""
+def wait_for_insert_blocked_by(engine: Engine, blocker_pid: int, timeout: float = 5.0) -> None:
+    """Return once an INSERT INTO events is waiting on the backend `blocker_pid`.
+
+    Tied to that backend, so a blocked insert from anything else sharing the test database
+    (another test run, say) can't satisfy it.
+    """
     # Autocommit: pg_stat_activity is read once per transaction and cached until it ends.
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         deadline = time.monotonic() + timeout
@@ -112,9 +116,10 @@ def wait_for_insert_blocked_on_a_lock(engine: Engine, timeout: float = 5.0) -> N
             waiting = connection.scalar(
                 text(
                     "SELECT count(*) FROM pg_stat_activity"
-                    " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                    " WHERE :blocker = ANY(pg_blocking_pids(pid))"
                     " AND query ILIKE 'INSERT INTO events%'"
-                )
+                ),
+                {"blocker": blocker_pid},
             )
             if waiting:
                 return
@@ -140,7 +145,7 @@ def test_concurrent_requests_with_the_same_key_create_one_event(
 
     def fan_out_once_the_second_request_waits(db: Session, event: Event) -> None:
         first_inserted.set()
-        wait_for_insert_blocked_on_a_lock(engine)
+        wait_for_insert_blocked_by(engine, db.scalar(text("SELECT pg_backend_pid()")))
         fan_out(db, event)
 
     monkeypatch.setattr(events_api, "_fan_out", fan_out_once_the_second_request_waits)
