@@ -403,8 +403,8 @@ latency stays under one second. Latency is per event: from when Hookline accepte
 (`events.created_at`) to when its first delivery attempt reached the
 [mock receiver](#mock-receiver). For each rate, [k6](loadtest/events.js) sends events at that
 rate, the script waits until every accepted event has arrived, then measures. It stops at
-the first rate that misses; a rate also misses if k6 couldn't hold it or an event never
-arrived.
+the first rate that misses; a rate also misses if k6 couldn't hold it, a request wasn't
+accepted, or an event never arrived.
 
 ```bash
 docker compose up -d && docker compose up -d receiver
@@ -412,7 +412,8 @@ uv run python scripts/load_test.py --rates 50,100,200,400 --duration 30s
 ```
 
 k6 runs from the `grafana/k6` image, so nothing needs installing. `--all` runs every rate
-even after a miss. Results are also saved to `loadtest/results/`. The events stay in the
+even after a miss. To test another API, pass both `--api-url` (as this script reaches it)
+and `--k6-api-url` (as the k6 container does). Results are also saved to `loadtest/results/`. The events stay in the
 database; the endpoint and receiver state are cleaned up.
 
 ### Results

@@ -62,7 +62,8 @@ def parse_k6_summary(stdout: str) -> dict:
 @dataclass
 class StepResult:
     rate: int
-    # Accepted by the API (202).
+    # Requests k6 made, and how many of them the API accepted (202).
+    requests: int
     sent: int
     # Requests k6 couldn't start on time because the API was too slow: the rate wasn't held.
     dropped: int
@@ -79,6 +80,7 @@ class StepResult:
         return (
             self.dropped == 0
             and self.sent > 0
+            and self.sent == self.requests
             and self.delivered == self.sent
             and self.p95_ms is not None
             and self.p95_ms < TARGET_P95_MS
@@ -89,6 +91,7 @@ class StepResult:
         stats = [percentile(latencies, p) for p in (50, 95, 99, 100)] if latencies else [None] * 4
         return cls(
             rate=k6["rate"],
+            requests=int(k6["requests"]),
             sent=int(k6["accepted"]),
             dropped=int(k6["dropped"]),
             post_p95_ms=k6["post_p95_ms"],
@@ -100,13 +103,14 @@ class StepResult:
         )
 
 
-def run_k6(rate: int, duration: str, event_type: str, api_key: str) -> dict:
+def run_k6(args: argparse.Namespace, rate: int, event_type: str) -> dict:
     command = ["docker", "compose", "run", "--rm", "--quiet-pull"]
     for name, value in {
+        "API_URL": args.k6_api_url,
+        "API_KEY": args.api_key,
         "RATE": rate,
-        "DURATION": duration,
+        "DURATION": args.duration,
         "EVENT_TYPE": event_type,
-        "API_KEY": api_key,
     }.items():
         command += ["-e", f"{name}={value}"]
     command += ["k6", "run", "--quiet", "/loadtest/events.js"]
@@ -116,13 +120,28 @@ def run_k6(rate: int, duration: str, event_type: str, api_key: str) -> dict:
     return parse_k6_summary(result.stdout)
 
 
-def wait_for_deliveries(receiver: httpx2.Client, expected: int, timeout: float) -> int:
-    """Poll the receiver until `expected` events arrived or `timeout` passed; return how many."""
+def arrivals(received: dict[str, dict], event_ids: set[str]) -> dict[str, datetime]:
+    """When each of these events first reached the receiver, for those delivered.
+
+    Only these ids: a late delivery from an earlier step, arriving after the receiver was
+    reset, must not count towards this one.
+    """
+    return {
+        event_id: datetime.fromisoformat(record["first_seen_at"])
+        for event_id, record in received.items()
+        if event_id in event_ids and record["delivered"]
+    }
+
+
+def wait_for_deliveries(
+    receiver: httpx2.Client, event_ids: set[str], timeout: float
+) -> dict[str, datetime]:
+    """Poll until every one of these events arrived or `timeout` passed; return the arrivals."""
     deadline = time.monotonic() + timeout
     while True:
-        unique = receiver.get("/stats").raise_for_status().json()["unique_events"]
-        if unique >= expected or time.monotonic() >= deadline:
-            return unique
+        arrived = arrivals(receiver.get("/received").raise_for_status().json(), event_ids)
+        if len(arrived) == len(event_ids) or time.monotonic() >= deadline:
+            return arrived
         time.sleep(1)
 
 
@@ -134,22 +153,35 @@ def event_times(database_url: str, event_type: str) -> dict[str, datetime]:
     return {str(event_id): created_at for event_id, created_at in rows}
 
 
-def first_attempts(receiver: httpx2.Client) -> dict[str, datetime]:
-    received = receiver.get("/received").raise_for_status().json()
-    return {
-        event_id: datetime.fromisoformat(record["first_seen_at"])
-        for event_id, record in received.items()
-    }
+def step_event_types(run_id: str, rates: list[int]) -> list[str]:
+    """One event type per step, even for a repeated rate: k6's idempotency keys restart at 0
+    each run, so a shared type would replay the earlier step's events instead of sending."""
+    return [f"loadtest.{run_id}.s{step}.r{rate}" for step, rate in enumerate(rates, 1)]
+
+
+def clean_up(api: httpx2.Client, receiver: httpx2.Client, endpoint_id: str) -> list[str]:
+    """Delete the test endpoint and clear the receiver; return what failed, having tried both."""
+    failures = []
+    for what, send in [
+        ("delete the test endpoint", lambda: api.delete(f"/endpoints/{endpoint_id}")),
+        ("clear the receiver", lambda: receiver.delete("/received")),
+    ]:
+        try:
+            send().raise_for_status()
+        except httpx2.HTTPError as exc:
+            failures.append(f"Couldn't {what}: {exc}")
+    return failures
 
 
 def run_step(
     args: argparse.Namespace, receiver: httpx2.Client, rate: int, event_type: str
 ) -> StepResult:
     receiver.delete("/received").raise_for_status()
-    k6 = run_k6(rate, args.duration, event_type, args.api_key)
-    delivered = wait_for_deliveries(receiver, int(k6["accepted"]), args.drain_timeout)
-    latencies = latencies_ms(event_times(args.database_url, event_type), first_attempts(receiver))
-    return StepResult.measure(k6, delivered, latencies)
+    k6 = run_k6(args, rate, event_type)
+    # Every accepted event is committed by now: the API answers 202 after the commit.
+    created = event_times(args.database_url, event_type)
+    arrived = wait_for_deliveries(receiver, set(created), args.drain_timeout)
+    return StepResult.measure(k6, len(arrived), latencies_ms(created, arrived))
 
 
 def print_results(results: list[StepResult]) -> None:
@@ -157,14 +189,14 @@ def print_results(results: list[StepResult]) -> None:
         return "-" if value is None else f"{value:.0f}"
 
     print(
-        f"\n{'rate/s':>7} {'sent':>7} {'dropped':>8} {'delivered':>10} "
+        f"\n{'rate/s':>7} {'requests':>9} {'sent':>7} {'dropped':>8} {'delivered':>10} "
         f"{'p50 ms':>7} {'p95 ms':>7} {'p99 ms':>7} {'max ms':>7} {'POST p95':>9}"
     )
     for r in results:
         print(
-            f"{r.rate:>7} {r.sent:>7} {r.dropped:>8} {r.delivered:>10} {ms(r.p50_ms):>7} "
-            f"{ms(r.p95_ms):>7} {ms(r.p99_ms):>7} {ms(r.max_ms):>7} {r.post_p95_ms:>9.1f}"
-            + ("" if r.passed else "   <- missed")
+            f"{r.rate:>7} {r.requests:>9} {r.sent:>7} {r.dropped:>8} {r.delivered:>10} "
+            f"{ms(r.p50_ms):>7} {ms(r.p95_ms):>7} {ms(r.p99_ms):>7} {ms(r.max_ms):>7} "
+            f"{r.post_p95_ms:>9.1f}" + ("" if r.passed else "   <- missed")
         )
     best = max((r.rate for r in results if r.passed), default=None)
     print(
@@ -179,7 +211,12 @@ def main() -> None:
     parser.add_argument("--duration", default="30s", help="how long each rate runs (k6 syntax)")
     parser.add_argument("--drain-timeout", type=float, default=120, help="seconds per rate")
     parser.add_argument("--all", action="store_true", help="run every rate, even after a miss")
-    parser.add_argument("--api-url", default="http://localhost:8000")
+    parser.add_argument("--api-url", default="http://localhost:8000", help="for setup, from here")
+    parser.add_argument(
+        "--k6-api-url",
+        default="http://api:8000",
+        help="the same API as k6 reaches it, from its container on the compose network",
+    )
     parser.add_argument("--receiver-url", default="http://localhost:9000")
     parser.add_argument(
         "--api-key",
@@ -197,7 +234,7 @@ def main() -> None:
     rates = [int(rate) for rate in args.rates.split(",")]
 
     run_id = uuid.uuid4().hex[:8]
-    event_types = {rate: f"loadtest.{run_id}.r{rate}" for rate in rates}
+    event_types = step_event_types(run_id, rates)
     api = httpx2.Client(
         base_url=args.api_url, headers={"Authorization": f"Bearer {args.api_key}"}, timeout=10
     )
@@ -205,7 +242,7 @@ def main() -> None:
 
     response = api.post(
         "/endpoints",
-        json={"url": "http://receiver:9000/webhook", "event_types": list(event_types.values())},
+        json={"url": "http://receiver:9000/webhook", "event_types": event_types},
     )
     if response.status_code == 422:
         sys.exit(f"{response.json()['detail']}: is ALLOWED_INTERNAL_HOSTS=receiver:9000 set?")
@@ -215,15 +252,14 @@ def main() -> None:
         receiver.patch(
             "/config", json={"secret": endpoint["secret"], "fail_percent": 0, "delay_ms": 0}
         ).raise_for_status()
-        for rate in rates:
+        for rate, event_type in zip(rates, event_types, strict=True):
             print(f"{rate} events/s for {args.duration}...", flush=True)
-            result = run_step(args, receiver, rate, event_types[rate])
+            result = run_step(args, receiver, rate, event_type)
             results.append(result)
             if not result.passed and not args.all:
                 break
     finally:
-        api.delete(f"/endpoints/{endpoint['id']}")
-        receiver.delete("/received")
+        cleanup_failures = clean_up(api, receiver, endpoint["id"])
 
     print_results(results)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -240,6 +276,8 @@ def main() -> None:
         )
     )
     print(f"Saved {path.relative_to(ROOT)}")
+    if cleanup_failures:
+        sys.exit("\n".join(cleanup_failures))
 
 
 if __name__ == "__main__":

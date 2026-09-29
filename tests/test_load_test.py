@@ -1,13 +1,17 @@
 from datetime import UTC, datetime, timedelta
 
+import httpx2
 import pytest
 
 from scripts.load_test import (
     TARGET_P95_MS,
     StepResult,
+    arrivals,
+    clean_up,
     latencies_ms,
     parse_k6_summary,
     percentile,
+    step_event_types,
 )
 
 T0 = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
@@ -66,7 +70,52 @@ def test_step_passes_when_everything_arrived_fast_enough():
         (K6 | {"dropped": 4}, 3, [100.0, 200.0, 300.0]),  # the rate wasn't held
         (K6, 2, [100.0, 200.0]),  # an event never arrived
         (K6 | {"accepted": 0}, 0, []),  # nothing was accepted
+        (K6 | {"requests": 4}, 3, [100.0, 200.0, 300.0]),  # one request wasn't accepted
     ],
 )
 def test_step_misses(k6: dict, delivered: int, latencies: list[float]):
     assert not StepResult.measure(k6, delivered, latencies).passed
+
+
+def test_arrivals_count_only_this_steps_delivered_events():
+    received = {
+        "mine": {"first_seen_at": "2026-09-29T12:00:00.250000+00:00", "delivered": 1},
+        "mine-failed-so-far": {"first_seen_at": "2026-09-29T12:00:00+00:00", "delivered": 0},
+        # A late delivery from the step before, after the receiver was reset.
+        "earlier-step": {"first_seen_at": "2026-09-29T12:00:00+00:00", "delivered": 1},
+    }
+
+    arrived = arrivals(received, {"mine", "mine-failed-so-far", "not-yet"})
+
+    assert arrived == {"mine": T0 + timedelta(milliseconds=250)}
+
+
+def test_every_step_gets_its_own_event_type():
+    types = step_event_types("abc", [50, 50, 100])
+
+    assert types == ["loadtest.abc.s1.r50", "loadtest.abc.s2.r50", "loadtest.abc.s3.r100"]
+
+
+def client(status_code: int, calls: list[str]) -> httpx2.Client:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        return httpx2.Response(status_code)
+
+    return httpx2.Client(base_url="http://test", transport=httpx2.MockTransport(handler))
+
+
+def test_clean_up_reports_nothing_when_both_succeed():
+    calls: list[str] = []
+
+    assert clean_up(client(204, calls), client(204, calls), "ep1") == []
+    assert calls == ["DELETE /endpoints/ep1", "DELETE /received"]
+
+
+def test_clean_up_reports_a_failure_and_still_tries_the_rest():
+    calls: list[str] = []
+
+    failures = clean_up(client(500, calls), client(204, calls), "ep1")
+
+    assert calls == ["DELETE /endpoints/ep1", "DELETE /received"]
+    assert len(failures) == 1
+    assert failures[0].startswith("Couldn't delete the test endpoint")
