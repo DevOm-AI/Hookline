@@ -61,9 +61,10 @@ In `.env`, set:
 - `POSTGRES_PASSWORD`. `DATABASE_URL` picks it up from there.
 - `API_KEY_HASH`: see the next step.
 
-Leave `ENVIRONMENT=production`, `DEBUG=false` and `ALLOWED_INTERNAL_HOSTS` empty. With
-`ENVIRONMENT=production`, Hookline refuses to start if `DEBUG` is true, `API_KEY_HASH` is
-missing or is the local dev key's, or `ALLOWED_INTERNAL_HOSTS` lists anything.
+Leave `DEBUG=false` and `ALLOWED_INTERNAL_HOSTS` empty. The production compose file always
+sets `ENVIRONMENT=production`, whatever `.env` says, and in production Hookline refuses to
+start if `DEBUG` is true, `API_KEY_HASH` is missing or is the local dev key's, or
+`ALLOWED_INTERNAL_HOSTS` lists anything.
 
 ## 4. Generate the API key
 
@@ -115,23 +116,39 @@ first again. Workers get SIGTERM and up to 60 seconds to finish their sends (see
 again once its lock expires, so updating loses nothing. The API is unavailable for the few
 seconds its container restarts.
 
+If an update fails, `docker compose -f docker-compose.prod.yml ps` and `logs` show which
+service. To go back, check out the previous commit (`git log` lists them) and run the same
+`up -d --build`. If the failed update had already applied a migration, downgrade it first:
+`docker compose -f docker-compose.prod.yml run --rm api alembic downgrade -1`, once per
+migration it added.
+
 ### Automatic deploys
 
 [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) does the same over SSH each
-time CI passes on `main`. It deploys the commit CI tested. Set these repository secrets
-(Settings → Secrets and variables → Actions); until all three are set, the deploy is
-skipped:
+time CI passes on `main`. It deploys the commit CI tested, one deploy at a time, in order.
+Set these repository secrets (Settings → Secrets and variables → Actions). With none set,
+deploys are skipped; with only some set, the workflow fails and names the missing ones.
 
 | Secret | Value |
 | --- | --- |
 | `DEPLOY_HOST` | The VM's IP or hostname |
 | `DEPLOY_USER` | The user that owns `~/hookline` and is in the `docker` group |
 | `DEPLOY_SSH_KEY` | A private key whose public half is in that user's `~/.ssh/authorized_keys` |
-| `DEPLOY_KNOWN_HOSTS` | Optional: the output of `ssh-keyscan <host>`, verified against the VM |
+| `DEPLOY_KNOWN_HOSTS` | The VM's SSH host keys, read on the VM itself (below) |
 
 Use a key made only for this, e.g. `ssh-keygen -t ed25519 -f hookline-deploy -N ""`.
-Without `DEPLOY_KNOWN_HOSTS`, each run trusts whatever host key the VM presents at that
-moment.
+
+The workflow connects only to a server holding one of the host keys in `DEPLOY_KNOWN_HOSTS`,
+so a machine impersonating the VM can't receive the deploy. Read the keys from the VM's own
+files, not with `ssh-keyscan` from elsewhere, which would trust whoever answers. On the VM,
+with `DEPLOY_HOST`'s exact value as the name:
+
+```bash
+for f in /etc/ssh/ssh_host_*_key.pub; do echo "203.0.113.7 $(cut -d' ' -f1,2 "$f")"; done
+```
+
+Paste the output as the secret. If the VM's host keys ever change (it is rebuilt, say),
+deploys fail until you update it.
 
 ## Backups
 
@@ -163,15 +180,21 @@ The dump is written to a `.tmp` file first, so a failed run never leaves a trunc
 under a real name. These backups are on the same disk as the database: copy them off the
 VM too (e.g. `rclone` to object storage), or losing the VM loses both.
 
-To restore a dump into the running stack:
+To restore a dump into the running stack, pick one from `ls /var/backups/hookline`:
 
 ```bash
+dump=/var/backups/hookline/hookline-YYYY-MM-DD.dump   # replace with the one to restore
 docker compose -f docker-compose.prod.yml stop api worker beat
 docker compose -f docker-compose.prod.yml exec -T postgres \
-  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
-  < /var/backups/hookline/hookline-2026-09-29.dump
-docker compose -f docker-compose.prod.yml up -d
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --single-transaction --exit-on-error' \
+  < "$dump" \
+  && docker compose -f docker-compose.prod.yml up -d
 ```
+
+The restore runs as one transaction and stops at the first error, so it either replaces the
+whole database or changes nothing, and Hookline is started again only if it succeeded. If it
+fails, the database is as it was before: fix the cause and run it again, or start Hookline
+on the old data with `docker compose -f docker-compose.prod.yml up -d`.
 
 Deliveries that were `in_progress` when the dump was taken are picked up again by the
 sweeper once their lock has expired. Events accepted after the dump was taken are not in it.

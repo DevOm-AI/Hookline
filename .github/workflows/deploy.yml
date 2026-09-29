@@ -10,13 +10,16 @@ on:
 permissions:
   contents: read
 
-# One deploy at a time; a newer one waits instead of cutting an older one off mid-build.
+# One deploy at a time, in order. A deploy that has to wait is queued rather than replacing
+# the one already waiting, which would then never run (the default keeps one pending).
 concurrency:
   group: deploy
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  # Secrets can't be read in a job's `if`, so this job checks for them and says so.
+  # Secrets can't be read in a job's `if`, so this job checks for them. None set: deploys
+  # aren't set up, so skip. Some set: a mistake, so fail rather than skip without a word.
   check:
     runs-on: ubuntu-latest
     outputs:
@@ -27,12 +30,20 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
-          if [ -n "$DEPLOY_HOST" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_SSH_KEY" ]; then
+          missing=()
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::DEPLOY_HOST, DEPLOY_USER or DEPLOY_SSH_KEY is not set; skipping deploy."
+          elif [ "${#missing[@]}" -eq 4 ]; then
+            echo "::notice::No deploy secrets are set; skipping deploy."
             echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Deploy secrets missing: ${missing[*]}. Set all four, or none."
+            exit 1
           fi
 
   deploy:
@@ -48,20 +59,15 @@ jobs:
     steps:
       - name: Set up SSH
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          # Optional: the VM's `ssh-keyscan` output, checked out of band. Without it the host
-          # key is trusted on first sight, on every run.
+          # The VM's host keys, read on the VM itself (see docs/deploy.md), never scanned from
+          # here: a scan over the network would trust whoever answers.
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
-          fi
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
       # Deploys the commit CI tested, not whatever main is by now: a newer push gets its own
       # CI run and deploy. Older commits are already contained, so --ff-only leaves them be.
@@ -71,7 +77,8 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$SHA" <<'EOF'
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$SHA" <<'EOF'
           set -euo pipefail
           cd ~/hookline
           git fetch --quiet origin main
