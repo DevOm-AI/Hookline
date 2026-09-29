@@ -5,9 +5,13 @@ description = "A webhook delivery service that doesn't lose events."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "alembic>=1.20.0",
     "celery[redis]>=5.6.3",
     "fastapi>=0.141.1",
+    "psycopg[binary]>=3.3.6",
     "pydantic-settings>=2.15.0",
+    "redis>=6.4.0",
+    "sqlalchemy>=2.1.1",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -17,6 +21,14 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+# The local alembic/ folder would otherwise make ruff treat the package as first-party.
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+# Every migration imports op and sa from the template, even when it only needs one.
+"alembic/versions/*" = ["F401"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

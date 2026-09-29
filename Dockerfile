@@ -18,6 +18,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 RUN useradd --create-home --uid 1000 hookline
 USER hookline
