@@ -2,12 +2,76 @@
 
 ![CI](https://github.com/DevOm-AI/Hookline/actions/workflows/ci.yml/badge.svg)
 
-A webhook delivery service that doesn't lose events.
+A webhook delivery service that doesn't lose events: each one is saved in Postgres before the
+API answers, then signed, sent and retried, and kept as a dead letter to replay if all fail.
 
-Every accepted event is stored durably. Deliveries are never lost; events that arrive while
-an endpoint is paused can be recovered with `POST /endpoints/{id}/recover`.
+| [Chaos test](#chaos-test): workers killed mid-delivery | |
+| --- | --- |
+| Events sent | 10,001 |
+| Workers killed with SIGKILL | 11 |
+| Receiver failing on purpose | 20% of requests |
+| **Events lost** | **0** |
+| Duplicates | 2, caught by dedupe on `Hookline-Event-Id` |
 
-> Work in progress. The full README (architecture, design decisions, chaos test results) comes later.
+```mermaid
+flowchart LR
+    client([Your app]) -->|POST /events| api[API]
+    api -->|"event + deliveries,<br/>one transaction"| pg[("Postgres<br/>source of truth")]
+    beat[beat] -->|every 1 s| scheduler[scheduler job]
+    scheduler -->|"claim due deliveries<br/>FOR UPDATE SKIP LOCKED"| pg
+    scheduler -->|delivery ids| redis[("Redis<br/>wake-ups only")]
+    redis --> workers[workers]
+    workers -->|signed POST| receiver([Your endpoint])
+    workers -->|"attempt + result,<br/>only while locked"| pg
+    beat -->|every 30 s| sweeper[sweeper job]
+    sweeper -->|release expired locks| pg
+```
+
+## 60-second quickstart
+
+Requires Docker. This starts Hookline with the bundled [mock receiver](#mock-receiver) and
+sends it one event:
+
+```bash
+cp .env.example .env
+docker compose --profile receiver up -d --build --wait
+
+# Register the mock receiver and give it the signing secret, returned only this once
+SECRET=$(curl -s -X POST localhost:8000/endpoints \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -d '{"url": "http://receiver:9000/webhook", "event_types": ["order.shipped"]}' \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["secret"])')
+curl -s -X PATCH localhost:9000/config -H "Content-Type: application/json" \
+  -d "{\"secret\": \"$SECRET\"}"
+
+# Send an event, then see it arrive
+curl -s -X POST localhost:8000/events \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: quickstart-1" \
+  -d '{"type": "order.shipped", "payload": {"order_id": 42}}'
+sleep 2 && curl -s localhost:9000/stats   # "unique_events": 1
+```
+
+Then open the dashboard at http://localhost:8000/dashboard with the key `hk_local_dev_key`.
+To run it on a server, see [docs/deploy.md](docs/deploy.md).
+
+## Design decisions
+
+- **Postgres is the source of truth.** An event and its deliveries are committed in one
+  transaction before the API answers 202, and each delivery's state lives in its row. Redis
+  only carries wake-ups, so a lost queue message or a Redis restart delays a delivery but
+  can't drop it: the scheduler and sweeper find the work again in Postgres.
+- **At-least-once delivery, not exactly-once.** A sender can't know whether a request that
+  got no answer was processed, so resending is the only way never to lose an event.
+  Receivers dedupe on `Hookline-Event-Id`; see [At-least-once delivery](#at-least-once-delivery).
+- **`FOR UPDATE SKIP LOCKED` to claim work.** Several schedulers can claim due deliveries at
+  once without taking the same row or waiting on each other, using the database already
+  there instead of a separate lock service.
+- **No delivery backlog for paused endpoints, and `recover` instead.** Events accepted while
+  an endpoint is paused get no delivery for it, so a receiver that is gone for good doesn't
+  pile up rows forever, and one that comes back isn't flooded on resume.
+  `POST /endpoints/{id}/recover` creates the missing deliveries from the stored events when
+  you are ready, and running it twice creates nothing new.
 
 ## Run locally
 
@@ -509,3 +573,7 @@ tests (signatures, retry rules, backoff, URL checks), with no database:
 ```bash
 uv run pytest -m "not integration"
 ```
+
+## What broke and how I fixed it
+
+<!-- TODO: real incidents only: what broke, how it showed up, the fix. -->
