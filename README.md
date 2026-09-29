@@ -49,6 +49,17 @@ curl -X PATCH localhost:8000/endpoints/<id> \
 curl -X DELETE localhost:8000/endpoints/<id> -H "Authorization: Bearer hk_local_dev_key"
 ```
 
+## Events
+
+```bash
+# 202 Accepted: the event and one pending delivery per subscribed, active endpoint are saved
+# together. Resending the same Idempotency-Key returns the original event and creates nothing.
+curl -X POST localhost:8000/events \
+  -H "Authorization: Bearer hk_local_dev_key" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-42-shipped" \
+  -d '{"type": "order.shipped", "payload": {"order_id": 42}}'
+```
+
 ## Migrations
 
 Run Alembic inside a container, where `DATABASE_URL` points at the `postgres` service:
