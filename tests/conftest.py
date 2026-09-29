@@ -90,7 +90,15 @@ TEST_API_KEY = "hk_test_key"
 def client(db: Session) -> Iterator[TestClient]:
     """API client sending a valid API key, using the rolled-back test session."""
     settings = Settings(_env_file=None, api_key_hash=hash_api_key(TEST_API_KEY))
-    app.dependency_overrides[get_db] = lambda: db
+
+    def get_test_db() -> Iterator[Session]:
+        # Like get_db closing its session: whatever a request didn't commit is discarded.
+        try:
+            yield db
+        finally:
+            db.rollback()
+
+    app.dependency_overrides[get_db] = get_test_db
     app.dependency_overrides[get_settings] = lambda: settings
     try:
         yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})

@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI
 
 from app.api.endpoints import router as endpoints_router
+from app.api.events import router as events_router
 from app.api.health import router as health_router
 from app.core.config import get_settings
 
@@ -17,6 +18,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Hookline", debug=settings.debug)
     app.include_router(health_router)
     app.include_router(endpoints_router)
+    app.include_router(events_router)
     return app
 
 

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
 
@@ -38,3 +38,18 @@ class EndpointOut(BaseModel):
 
 class EndpointCreated(EndpointOut):
     secret: str = Field(description="Signing secret. Returned only once, so store it now.")
+
+
+class EventCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: EventType
+    payload: dict[str, Any]
+
+
+class EventAccepted(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    type: str
+    created_at: datetime
