@@ -87,6 +87,8 @@ def send_delivery(delivery_id: uuid.UUID) -> None:
     if outgoing is None:
         return
     result = _post(outgoing)
+    # A crash here, after the receiver got the request but before the result is saved, means
+    # the sweeper hands the delivery back and it is sent again: at-least-once, not exactly-once.
     _record(delivery_id, outgoing.attempt_count + 1, result)
 
 

@@ -78,7 +78,7 @@ not followed) with these headers:
 
 | Header | Value |
 | --- | --- |
-| `Hookline-Event-Id` | The event's id. Dedupe on it: a delivery can arrive more than once. |
+| `Hookline-Event-Id` | The event's id. Dedupe on it: see [At-least-once delivery](#at-least-once-delivery). |
 | `Hookline-Event-Type` | The event's type, e.g. `order.shipped` |
 | `Hookline-Signature` | `t=<unix time>,v1=<hex HMAC-SHA256>`, see [Verifying signatures](#verifying-signatures) |
 
@@ -113,6 +113,42 @@ If a worker dies mid-send, or a queued task is lost, its delivery would stay `in
 forever. Every 30 seconds a sweeper job sets `in_progress` deliveries whose 60-second lock
 has expired back to `pending`, and the scheduler claims them again on its next tick.
 Postgres, not Redis, is what guarantees the work gets done.
+
+## At-least-once delivery
+
+Hookline delivers every event **at least once**, not exactly once. Your receiver can get the
+same event more than once:
+
+- A worker dies after your receiver got the request but before Hookline saved the result.
+  The sweeper hands the delivery back and it is sent again.
+- Your receiver handles the request but answers after the 10-second timeout, or the response
+  is lost on the way back. Hookline sees a failure and retries.
+- A worker holds a delivery past its 60-second lock (a backed-up queue, say), and the sweeper
+  gives it to another worker.
+
+No webhook sender can avoid this. Hookline can't know whether a request it never got an
+answer to was processed, and resending is the only way not to lose the event. Stripe,
+GitHub and Shopify webhooks work the same way.
+
+**Dedupe on `Hookline-Event-Id`.** It is the same on every retry and resend of an event (the
+signature is not: each try is signed with its own timestamp). Record the ids you have
+processed in the same transaction as the work itself, so a crash rolls back both:
+
+```python
+# processed_events.event_id is the primary key.
+with db.begin():
+    first_time = db.execute(
+        text("INSERT INTO processed_events (event_id) VALUES (:id) ON CONFLICT DO NOTHING"),
+        {"id": request.headers["Hookline-Event-Id"]},
+    ).rowcount
+    if first_time:
+        handle(event)
+```
+
+Answer a duplicate with 2xx too, or Hookline keeps retrying it. The id belongs to the
+event, so an event sent to several of your endpoints has the same id at each; if one
+receiver serves several endpoints, dedupe per endpoint. Keep responses under 10 seconds:
+queue slow work and answer right away.
 
 ## Verifying signatures
 

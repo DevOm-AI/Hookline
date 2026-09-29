@@ -26,6 +26,7 @@ from app.workers.delivery import (
     retry_delay,
 )
 from app.workers.scheduler import claim_due_deliveries
+from app.workers.sweeper import release_stuck_deliveries
 
 PAYLOAD = {"order_id": 42, "note": "café"}
 SECRET = "whsec_x"
@@ -401,6 +402,44 @@ def test_tasks_are_acked_only_after_they_finish():
     assert celery_app.conf.task_acks_late is True
     assert celery_app.conf.task_reject_on_worker_lost is True
     assert celery_app.conf.worker_prefetch_multiplier == 1
+
+
+class WorkerKilled(Exception):
+    pass
+
+
+def test_crash_after_the_receiver_got_it_means_it_is_sent_again(
+    db: Session, receiver: Receiver, monkeypatch: pytest.MonkeyPatch
+):
+    """At least once: the receiver answered 2xx, but the worker died before saving that."""
+    delivery = add_delivery(db)
+
+    def killed(*args: object) -> None:
+        raise WorkerKilled
+
+    with monkeypatch.context() as crash:
+        crash.setattr(worker, "_record", killed)
+        with pytest.raises(WorkerKilled):
+            run(db, delivery)
+
+    # Nothing was saved. Once the lock runs out, the sweeper hands it back to the scheduler.
+    db.execute(
+        update(Delivery)
+        .where(Delivery.id == delivery.id)
+        .values(locked_until=func.now() - timedelta(seconds=1))
+    )
+    assert release_stuck_deliveries(db) == [delivery.id]
+    assert claim_due_deliveries(db) == [delivery.id]
+    run(db, delivery)
+
+    # The receiver got it twice, with the same id to dedupe on.
+    assert [r.headers["Hookline-Event-Id"] for r in receiver.requests] == [
+        str(delivery.event_id)
+    ] * 2
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    # Only the attempt that was saved counts.
+    assert delivery.attempt_count == 1
+    assert len(attempts_for(db, delivery)) == 1
 
 
 class LocalReceiver:
