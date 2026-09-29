@@ -7,6 +7,10 @@ x-app: &app
   build: .
   image: hookline:prod
   env_file: .env
+  # Overrides .env, so the production checks in app/core/config.py always run here: an .env
+  # copied from .env.example can't start this public stack with the local dev key.
+  environment:
+    ENVIRONMENT: production
   depends_on:
     postgres:
       condition: service_healthy
