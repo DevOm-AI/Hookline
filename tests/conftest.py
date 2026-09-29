@@ -116,8 +116,12 @@ def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
     """
     records = {"example.com": ["93.184.215.14"], "localhost": ["127.0.0.1", "::1"]}
     real_getaddrinfo = socket.getaddrinfo
+    # psycopg resolves the database host through socket.getaddrinfo too; leave it real.
+    database_host = make_url(TEST_DATABASE_URL).host
 
     def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host == database_host:
+            return real_getaddrinfo(host, port, *args, **kwargs)
         if host in records:
             return [
                 (
