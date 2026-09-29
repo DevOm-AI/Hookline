@@ -2,7 +2,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx2
 from sqlalchemy import select, update
@@ -10,6 +10,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.core.signing import SIGNATURE_HEADER, sign
 from app.core.url_safety import UnsafeURLError, resolve_public_addresses
 from app.models import Delivery, DeliveryAttempt, DeliveryStatus
 from app.workers.celery_app import celery_app
@@ -30,6 +31,8 @@ class Outgoing:
     """Everything needed to send, read up front so no transaction stays open during the POST."""
 
     url: str
+    # repr=False keeps the secret out of logs and tracebacks.
+    secret: str = field(repr=False)
     event_id: uuid.UUID
     event_type: str
     body: bytes
@@ -87,6 +90,7 @@ def _load(delivery_id: uuid.UUID) -> Outgoing | None:
 
         return Outgoing(
             url=delivery.endpoint.url,
+            secret=delivery.endpoint.secret,
             event_id=delivery.event.id,
             event_type=delivery.event.type,
             body=json.dumps(delivery.event.payload, separators=(",", ":")).encode(),
@@ -101,6 +105,8 @@ def _post(outgoing: Outgoing) -> AttemptResult:
         "Accept-Encoding": "identity",
         "Hookline-Event-Id": str(outgoing.event_id),
         "Hookline-Event-Type": outgoing.event_type,
+        # Signed per try with the current time, over exactly the bytes sent below.
+        SIGNATURE_HEADER: sign(outgoing.secret, outgoing.body),
     }
     started = time.monotonic()
 
