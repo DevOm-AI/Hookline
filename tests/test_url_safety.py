@@ -127,3 +127,20 @@ def test_allowed_hosts_match_exact_names_only(dns: dict[str, list[str]], host: s
 
     with pytest.raises(UnsafeURLError, match="private or internal"):
         ensure_public_url(f"http://{host}:9000/webhook", allowed_hosts=["receiver"])
+
+
+def test_allowed_host_with_a_port_allows_only_that_port(dns: dict[str, list[str]]):
+    dns["receiver"] = ["172.18.0.5"]
+    allowed = ["receiver:9000"]
+
+    ensure_public_url("http://receiver:9000/webhook", allowed_hosts=allowed)
+    for url in ["http://receiver:5432/", "http://receiver/webhook", "https://receiver/webhook"]:
+        with pytest.raises(UnsafeURLError, match="private or internal"):
+            ensure_public_url(url, allowed_hosts=allowed)
+
+
+def test_allowed_host_port_uses_the_scheme_default(dns: dict[str, list[str]]):
+    dns["receiver"] = ["172.18.0.5"]
+
+    ensure_public_url("https://receiver/webhook", allowed_hosts=["receiver:443"])
+    ensure_public_url("http://receiver/webhook", allowed_hosts=["receiver:80"])

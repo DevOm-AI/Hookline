@@ -70,8 +70,10 @@ services:
       RECEIVER_DELAY_MS: ${RECEIVER_DELAY_MS:-0}
     volumes:
       - ./receiver:/app/receiver
+    # Loopback only: the control routes (/config, /received) have no auth. Other containers
+    # on the compose network, the workers among them, still reach it as receiver:9000.
     ports:
-      - "${RECEIVER_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${RECEIVER_HOST_PORT:-9000}:9000"
     healthcheck:
       test:
         - CMD

@@ -347,7 +347,7 @@ def test_allowed_internal_host_is_delivered_to(
     db: Session, settings: Settings, receiver: Receiver, dns: dict[str, list[str]]
 ):
     dns["receiver"] = ["172.18.0.5"]
-    settings.allowed_internal_hosts = ["receiver"]
+    settings.allowed_internal_hosts = ["receiver:9000"]
     delivery = add_delivery(db, url="http://receiver:9000/webhook")
 
     run(db, delivery)
@@ -356,6 +356,19 @@ def test_allowed_internal_host_is_delivered_to(
     [request] = receiver.requests
     assert request.url == "http://172.18.0.5:9000/webhook"
     assert request.headers["Host"] == "receiver:9000"
+
+
+def test_allowed_internal_host_on_another_port_is_blocked(
+    db: Session, settings: Settings, receiver: Receiver, dns: dict[str, list[str]]
+):
+    dns["receiver"] = ["172.18.0.5"]
+    settings.allowed_internal_hosts = ["receiver:9000"]
+    delivery = add_delivery(db, url="http://receiver:6379/")
+
+    run(db, delivery)
+
+    assert receiver.requests == []
+    assert delivery.status == DeliveryStatus.DEAD
 
 
 def test_mock_receiver_verifies_what_the_worker_sends(

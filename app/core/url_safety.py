@@ -29,7 +29,8 @@ def ensure_public_url(
     """Raise UnsafeURLError unless every address the URL's host resolves to is public.
 
     allow_loopback (DEBUG only) additionally permits localhost, 127.0.0.0/8 and ::1.
-    allowed_hosts are hostnames trusted whatever they resolve to (ALLOWED_INTERNAL_HOSTS).
+    allowed_hosts are hostnames trusted whatever they resolve to (ALLOWED_INTERNAL_HOSTS):
+    "host" for any port, "host:port" for that port only.
 
     This alone is a registration-time check. DNS can change afterwards (rebinding), so the
     delivery worker uses resolve_public_addresses and connects only to addresses it checked.
@@ -53,8 +54,9 @@ def resolve_public_addresses(
     addresses = _resolve(host, port)
     if not addresses:
         raise UnresolvableHostError("URL host could not be resolved")
-    # hostname is lowercase. The whole name is trusted, so its addresses aren't checked.
-    trusted = host in allowed_hosts
+    # hostname is lowercase. A trusted name's addresses aren't checked: it is trusted whatever
+    # it resolves to, so list only names your own DNS (e.g. docker compose) answers for.
+    trusted = host in allowed_hosts or f"{host}:{port}" in allowed_hosts
     for address in addresses:
         if trusted:
             continue

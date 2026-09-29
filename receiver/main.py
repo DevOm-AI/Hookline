@@ -49,6 +49,8 @@ class BehaviourUpdate(BaseModel):
 
 
 class BehaviourOut(BaseModel):
+    """GET and PATCH /config: the behaviour, with the secret reduced to whether it is set."""
+
     secret_set: bool
     fail_percent: float
     delay_ms: int
@@ -66,6 +68,8 @@ class Received:
 
 
 class Stats(BaseModel):
+    """GET /stats."""
+
     requests: int = Field(description="Every request, signed or not.")
     rejected: int = Field(description="Answered 401 or 400: bad signature or no event id.")
     failed: int = Field(description="Answered 500 on purpose (fail_percent).")
@@ -75,19 +79,17 @@ class Stats(BaseModel):
     undelivered_events: int = Field(description="Event ids seen, but never answered 2xx.")
 
 
-class Receiver:
-    def __init__(self, behaviour: Behaviour) -> None:
-        self.behaviour = behaviour
-        self.random = random.Random()
-        self.reset()
+class Records:
+    """Everything received since the last reset."""
 
-    def reset(self) -> None:
+    def __init__(self) -> None:
         self.events: dict[str, Received] = {}
         self.requests = 0
         self.rejected = 0
         self.failed = 0
 
     def stats(self) -> Stats:
+        """Totals over every request, and over event ids."""
         delivered = sum(received.delivered for received in self.events.values())
         unique = sum(1 for received in self.events.values() if received.delivered)
         return Stats(
@@ -101,33 +103,53 @@ class Receiver:
         )
 
 
+class Receiver:
+    """The receiver's state: how it answers, and what it has received."""
+
+    def __init__(self, behaviour: Behaviour) -> None:
+        self.behaviour = behaviour
+        self.random = random.Random()
+        self.records = Records()
+
+    def reset(self) -> None:
+        """Start new records. A request still in flight finishes into the old ones."""
+        self.records = Records()
+
+
 def create_app(behaviour: Behaviour | None = None) -> FastAPI:
+    """The receiver app, answering as `behaviour` says (default: RECEIVER_* env vars)."""
     app = FastAPI(title="Hookline mock receiver")
     # Every handler is async (sync ones would run in a threadpool) and none awaits between
     # reading and updating this state, so the single event loop needs no locks.
     receiver = Receiver(behaviour or Behaviour())
     app.state.receiver = receiver
 
+    # The only POST route. Hookline delivers with POST, so an endpoint registered at any other
+    # path of this receiver gets a 405 and can't change its config or records.
     @app.post("/webhook")
     async def webhook(
         request: Request,
         signature: Annotated[str | None, Header(alias=SIGNATURE_HEADER)] = None,
         event_id: Annotated[str | None, Header(alias="Hookline-Event-Id")] = None,
     ) -> Response:
-        receiver.requests += 1
+        """Verify the signature, record the event id, then answer as configured."""
+        # Read once, before any await: a reset mid-request leaves this request's counts in
+        # the records it started in, not half in the new ones.
+        records = receiver.records
+        records.requests += 1
         # The raw bytes: re-serialised JSON could differ and fail the check.
         body = await request.body()
         secret = receiver.behaviour.secret
         if secret is None or signature is None or not verify_signature(secret, body, signature):
-            receiver.rejected += 1
+            records.rejected += 1
             return Response(status_code=status.HTTP_401_UNAUTHORIZED)
         if not event_id:
-            receiver.rejected += 1
+            records.rejected += 1
             return Response(status_code=status.HTTP_400_BAD_REQUEST)
 
-        received = receiver.events.get(event_id)
+        received = records.events.get(event_id)
         if received is None:
-            received = receiver.events[event_id] = Received(first_seen_at=datetime.now(UTC))
+            received = records.events[event_id] = Received(first_seen_at=datetime.now(UTC))
         received.attempts += 1
 
         # Read before sleeping, so a PATCH mid-request doesn't change this answer.
@@ -135,13 +157,14 @@ def create_app(behaviour: Behaviour | None = None) -> FastAPI:
         if behaviour.delay_ms:
             await asyncio.sleep(behaviour.delay_ms / 1000)
         if receiver.random.random() * 100 < behaviour.fail_percent:
-            receiver.failed += 1
+            records.failed += 1
             return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
         received.delivered += 1
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/config")
     async def get_config() -> BehaviourOut:
+        """How the receiver answers now. The secret itself is never shown."""
         behaviour = receiver.behaviour
         return BehaviourOut(
             secret_set=behaviour.secret is not None,
@@ -151,6 +174,7 @@ def create_app(behaviour: Behaviour | None = None) -> FastAPI:
 
     @app.patch("/config")
     async def update_config(update: BehaviourUpdate) -> BehaviourOut:
+        """Change how the receiver answers; fields left out keep their value."""
         # Replaced, not changed in place: a request in flight keeps the one it read.
         receiver.behaviour = receiver.behaviour.model_copy(
             update=update.model_dump(exclude_none=True)
@@ -159,20 +183,22 @@ def create_app(behaviour: Behaviour | None = None) -> FastAPI:
 
     @app.get("/stats")
     async def get_stats() -> Stats:
-        return receiver.stats()
+        """Totals since the last reset."""
+        return receiver.records.stats()
 
     @app.get("/received")
     async def get_received() -> dict[str, Received]:
         """Every event id seen, with when it first arrived and how often."""
-        return receiver.events
+        return receiver.records.events
 
-    @app.post("/reset", status_code=status.HTTP_204_NO_CONTENT)
+    @app.delete("/received", status_code=status.HTTP_204_NO_CONTENT)
     async def reset() -> None:
         """Forget what was received; the config stays."""
         receiver.reset()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
+        """Liveness, for the compose healthcheck."""
         return {"status": "ok"}
 
     return app

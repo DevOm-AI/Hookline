@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     environment: Literal["local", "test", "production"] = "local"
     # Loosens local-only checks, e.g. allowing localhost endpoint URLs.
     debug: bool = False
-    # Endpoint hostnames allowed to resolve to private addresses, comma-separated: e.g.
-    # "receiver", the docker compose mock receiver. Exact names only; only hosts you run.
+    # Endpoint hosts allowed to resolve to private addresses, comma-separated: "host:port" for
+    # one port (e.g. "receiver:9000", the docker compose mock receiver), "host" for any port.
+    # Exact names only, and only ones your own DNS answers for: their addresses aren't checked.
     allowed_internal_hosts: Annotated[list[str], NoDecode] = []
 
     database_url: str = "postgresql+psycopg://hookline:hookline@localhost:5433/hookline"

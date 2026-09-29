@@ -35,7 +35,11 @@ def test_broker_url_can_be_overridden(monkeypatch):
 
 @pytest.mark.parametrize(
     ("value", "hosts"),
-    [("", []), ("receiver", ["receiver"]), (" Receiver , mock ,", ["receiver", "mock"])],
+    [
+        ("", []),
+        ("receiver:9000", ["receiver:9000"]),
+        (" Receiver:9000 , mock ,", ["receiver:9000", "mock"]),
+    ],
 )
 def test_allowed_internal_hosts_are_comma_separated(monkeypatch, value: str, hosts: list[str]):
     monkeypatch.setenv("ALLOWED_INTERNAL_HOSTS", value)

@@ -144,7 +144,7 @@ def test_create_allows_internal_hosts_only_when_listed(
     allowed = Settings(
         _env_file=None,
         api_key_hash=hash_api_key(TEST_API_KEY),
-        allowed_internal_hosts=["receiver"],
+        allowed_internal_hosts=["receiver:9000"],
     )
     app.dependency_overrides[get_settings] = lambda: allowed
 
