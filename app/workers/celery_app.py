@@ -16,6 +16,12 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     broker_connection_retry_on_startup=True,
+    # Ack a task only once it finishes, and requeue it if the worker process dies mid-task,
+    # so a crash never silently drops a delivery.
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    # With late acks, a worker holding prefetched messages would sit on work it isn't doing.
+    worker_prefetch_multiplier=1,
     beat_schedule={
         "schedule-due-deliveries": {
             "task": "hookline.schedule_due_deliveries",

@@ -1,6 +1,6 @@
 import pytest
 
-from app.core.url_safety import UnsafeURLError, ensure_public_url
+from app.core.url_safety import UnsafeURLError, ensure_public_url, resolve_public_addresses
 
 BLOCKED_HOSTS = [
     "127.0.0.1",  # loopback
@@ -76,3 +76,20 @@ def test_allow_loopback_permits_localhost(host: str):
 def test_allow_loopback_still_blocks_other_internal_addresses(host: str):
     with pytest.raises(UnsafeURLError):
         ensure_public_url(f"http://{host}/hook", allow_loopback=True)
+
+
+def test_resolve_public_addresses_returns_every_address_once_in_order(
+    dns: dict[str, list[str]],
+):
+    dns["example.com"] = ["2606:2800::1", "93.184.215.14", "2606:2800::1"]
+
+    addresses = resolve_public_addresses("https://example.com/hook")
+
+    assert [str(a) for a in addresses] == ["2606:2800::1", "93.184.215.14"]
+
+
+def test_resolve_public_addresses_applies_the_same_checks(dns: dict[str, list[str]]):
+    dns["example.com"] = ["93.184.215.14", "10.0.0.5"]
+
+    with pytest.raises(UnsafeURLError, match="private or internal"):
+        resolve_public_addresses("https://example.com/hook")

@@ -73,6 +73,25 @@ It marks them `in_progress` for 60 seconds, commits, and only then queues them f
 workers. Several schedulers can run at once without claiming the same delivery. Deliveries
 for a paused endpoint wait as `pending` until it's resumed.
 
+A worker then POSTs the event's JSON payload to the endpoint (10-second timeout, redirects
+not followed) with these headers:
+
+| Header | Value |
+| --- | --- |
+| `Hookline-Event-Id` | The event's id. Dedupe on it: a delivery can arrive more than once. |
+| `Hookline-Event-Type` | The event's type, e.g. `order.shipped` |
+
+Every try is logged in `delivery_attempts` with its status code, time taken and error. A
+2xx marks the delivery `succeeded`. Retries don't exist yet, so any other response,
+a timeout or a connection error marks it `dead`.
+
+The endpoint's host is resolved and checked again at send time, and the worker connects to
+exactly the address it checked. A name that has since started pointing at an internal
+address (DNS rebinding) is blocked.
+
+Celery tasks are acknowledged only after they finish (`acks_late`) and requeued if a
+worker process dies mid-task.
+
 ## Migrations
 
 Run Alembic inside a container, where `DATABASE_URL` points at the `postgres` service:

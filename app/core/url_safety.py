@@ -23,9 +23,14 @@ def ensure_public_url(url: str, *, allow_loopback: bool = False) -> None:
 
     allow_loopback (DEBUG only) additionally permits localhost, 127.0.0.0/8 and ::1.
 
-    This checks at registration time only. DNS can change afterwards (rebinding), so the
-    delivery worker must check the address it actually connects to as well.
+    This alone is a registration-time check. DNS can change afterwards (rebinding), so the
+    delivery worker uses resolve_public_addresses and connects only to addresses it checked.
     """
+    resolve_public_addresses(url, allow_loopback=allow_loopback)
+
+
+def resolve_public_addresses(url: str, *, allow_loopback: bool = False) -> list[IPAddress]:
+    """Check the URL like ensure_public_url and return its addresses, in resolver order."""
     parts = urlsplit(url)
     host = parts.hostname
     if not host:
@@ -35,12 +40,17 @@ def ensure_public_url(url: str, *, allow_loopback: bool = False) -> None:
     except ValueError as exc:
         raise UnsafeURLError("URL has an invalid port") from exc
 
-    for address in _resolve(host, port):
+    addresses = _resolve(host, port)
+    if not addresses:
+        raise UnsafeURLError("URL host could not be resolved")
+    for address in addresses:
         if _is_public(address):
             continue
         if allow_loopback and _unwrap(address).is_loopback:
             continue
         raise UnsafeURLError("URL resolves to a private or internal address")
+    # getaddrinfo repeats an address once per socket type/protocol it could use.
+    return list(dict.fromkeys(addresses))
 
 
 def _resolve(host: str, port: int) -> list[IPAddress]:
