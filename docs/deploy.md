@@ -117,10 +117,25 @@ again once its lock expires, so updating loses nothing. The API is unavailable f
 seconds its container restarts.
 
 If an update fails, `docker compose -f docker-compose.prod.yml ps` and `logs` show which
-service. To go back, check out the previous commit (`git log` lists them) and run the same
-`up -d --build`. If the failed update had already applied a migration, downgrade it first:
-`docker compose -f docker-compose.prod.yml run --rm api alembic downgrade -1`, once per
-migration it added.
+service. To go back to the previous commit (`git log` lists them):
+
+```bash
+prev=<the commit to go back to>
+# Its newest migration: the revision id in the last file name (files sort by date).
+rev=$(git ls-tree --name-only "$prev" alembic/versions/ | grep '\.py$' | sort | tail -1 \
+  | cut -d- -f2 | cut -d_ -f1)
+
+# 1. Undo the failed update's migrations first, while the image still has their files.
+#    --no-deps keeps `run` from starting the migrate service, which would upgrade again.
+docker compose -f docker-compose.prod.yml run --rm --no-deps api alembic downgrade "$rev"
+
+# 2. Then go back to the previous code (.env is untracked, so it stays) and rebuild.
+git reset --hard "$prev"
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+Downgrading to a revision the database is already at does nothing, so step 1 is safe even
+if the failed update added no migration or its migration never applied.
 
 ### Automatic deploys
 
