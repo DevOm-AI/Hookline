@@ -107,6 +107,13 @@ address (DNS rebinding) is blocked.
 Celery tasks are acknowledged only after they finish (`acks_late`) and requeued if a
 worker process dies mid-task.
 
+### Recovering stuck deliveries
+
+If a worker dies mid-send, or a queued task is lost, its delivery would stay `in_progress`
+forever. Every 30 seconds a sweeper job sets `in_progress` deliveries whose 60-second lock
+has expired back to `pending`, and the scheduler claims them again on its next tick.
+Postgres, not Redis, is what guarantees the work gets done.
+
 ## Verifying signatures
 
 Each request is signed with the endpoint's secret (the `whsec_...` value returned when the
