@@ -1,8 +1,13 @@
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from app.core.security import hash_api_key
+
+# The key .env.example ships with, for local use only; see the README's "API key".
+LOCAL_DEV_API_KEY_HASH = hash_api_key("hk_local_dev_key")
 
 
 class Settings(BaseSettings):
@@ -33,6 +38,26 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [host.strip().lower() for host in value.split(",") if host.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _check_production(self) -> "Settings":
+        # Refuse to start rather than run production with local-only settings.
+        if self.environment != "production":
+            return self
+        problems = []
+        if self.debug:
+            problems.append("DEBUG must be false (it allows localhost endpoint URLs)")
+        if self.api_key_hash is None:
+            problems.append("API_KEY_HASH must be set (generate one: python -m app.core.security)")
+        elif self.api_key_hash == LOCAL_DEV_API_KEY_HASH:
+            problems.append("API_KEY_HASH is the public local dev key's; generate a new one")
+        if self.allowed_internal_hosts:
+            problems.append(
+                "ALLOWED_INTERNAL_HOSTS must be empty (it lets endpoints reach private hosts)"
+            )
+        if problems:
+            raise ValueError("Unsafe settings for ENVIRONMENT=production: " + "; ".join(problems))
+        return self
 
     @property
     def broker_url(self) -> str:

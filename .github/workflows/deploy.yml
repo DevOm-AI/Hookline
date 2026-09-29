@@ -1,0 +1,88 @@
+name: Deploy
+
+# Deploys main to the VM once CI has passed on it. See docs/deploy.md.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One deploy at a time, in order. A deploy that has to wait is queued rather than replacing
+# the one already waiting, which would then never run (the default keeps one pending).
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  # Secrets can't be read in a job's `if`, so this job checks for them. None set: deploys
+  # aren't set up, so skip. Some set: a mistake, so fail rather than skip without a word.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.secrets.outputs.configured }}
+    steps:
+      - id: secrets
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=()
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ "${#missing[@]}" -eq 4 ]; then
+            echo "::notice::No deploy secrets are set; skipping deploy."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Deploy secrets missing: ${missing[*]}. Set all four, or none."
+            exit 1
+          fi
+
+  deploy:
+    needs: check
+    # Only a CI run for a push to this repository's main: a fork's pull request from a branch
+    # also named main triggers this workflow too.
+    if: >-
+      needs.check.outputs.configured == 'true'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          # The VM's host keys, read on the VM itself (see docs/deploy.md), never scanned from
+          # here: a scan over the network would trust whoever answers.
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # Deploys the commit CI tested, not whatever main is by now: a newer push gets its own
+      # CI run and deploy. Older commits are already contained, so --ff-only leaves them be.
+      - name: Pull and restart
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$SHA" <<'EOF'
+          set -euo pipefail
+          cd ~/hookline
+          git fetch --quiet origin main
+          git merge --ff-only "$1"
+          docker compose -f docker-compose.prod.yml up -d --build --wait
+          docker image prune -f
+          EOF
