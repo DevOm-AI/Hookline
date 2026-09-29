@@ -1,7 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.security import hash_api_key
 from app.main import app
 
 
@@ -57,3 +59,78 @@ def test_app_serves_docs():
     response = TestClient(app).get("/docs")
 
     assert response.status_code == 200
+
+
+PRODUCTION_KEY_HASH = hash_api_key("hk_production_key")
+
+
+def production_env(monkeypatch, **overrides: str) -> None:
+    env = {
+        "ENVIRONMENT": "production",
+        "DEBUG": "false",
+        "API_KEY_HASH": PRODUCTION_KEY_HASH,
+        "ALLOWED_INTERNAL_HOSTS": "",
+    }
+    env.update(overrides)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_production_settings_are_accepted(monkeypatch):
+    production_env(monkeypatch)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.environment == "production"
+    assert settings.api_key_hash == PRODUCTION_KEY_HASH
+
+
+def test_production_refuses_debug(monkeypatch):
+    production_env(monkeypatch, DEBUG="true")
+
+    with pytest.raises(ValidationError, match="DEBUG must be false"):
+        Settings(_env_file=None)
+
+
+def test_production_refuses_missing_api_key_hash(monkeypatch):
+    production_env(monkeypatch)
+    monkeypatch.delenv("API_KEY_HASH")
+
+    with pytest.raises(ValidationError, match="API_KEY_HASH must be set"):
+        Settings(_env_file=None)
+
+
+def test_production_refuses_local_dev_api_key_hash(monkeypatch):
+    production_env(monkeypatch, API_KEY_HASH=hash_api_key("hk_local_dev_key"))
+
+    with pytest.raises(ValidationError, match="local dev key"):
+        Settings(_env_file=None)
+
+
+def test_production_refuses_allowed_internal_hosts(monkeypatch):
+    production_env(monkeypatch, ALLOWED_INTERNAL_HOSTS="receiver:9000")
+
+    with pytest.raises(ValidationError, match="ALLOWED_INTERNAL_HOSTS must be empty"):
+        Settings(_env_file=None)
+
+
+def test_production_reports_every_problem_at_once(monkeypatch):
+    production_env(monkeypatch, DEBUG="true", ALLOWED_INTERNAL_HOSTS="receiver:9000")
+    monkeypatch.delenv("API_KEY_HASH")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+
+    message = str(exc_info.value)
+    assert "DEBUG" in message
+    assert "API_KEY_HASH" in message
+    assert "ALLOWED_INTERNAL_HOSTS" in message
+
+
+def test_local_settings_allow_debug_and_the_dev_key(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setenv("DEBUG", "true")
+    monkeypatch.setenv("API_KEY_HASH", hash_api_key("hk_local_dev_key"))
+    monkeypatch.setenv("ALLOWED_INTERNAL_HOSTS", "receiver:9000")
+
+    assert Settings(_env_file=None).debug is True
