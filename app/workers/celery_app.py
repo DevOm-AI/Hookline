@@ -8,7 +8,7 @@ settings = get_settings()
 celery_app = Celery(
     "hookline",
     broker=settings.broker_url,
-    include=["app.workers.delivery", "app.workers.scheduler"],
+    include=["app.workers.delivery", "app.workers.scheduler", "app.workers.sweeper"],
 )
 celery_app.conf.update(
     task_serializer="json",
@@ -28,6 +28,11 @@ celery_app.conf.update(
             "schedule": 1.0,
             # A tick nobody ran within a second is stale; the next one does the same work.
             "options": {"expires": 1.0},
+        },
+        "sweep-stuck-deliveries": {
+            "task": "hookline.sweep_stuck_deliveries",
+            "schedule": 30.0,
+            "options": {"expires": 30.0},
         },
     },
 )
