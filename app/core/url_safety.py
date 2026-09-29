@@ -6,6 +6,7 @@ http://postgres:5432/ and make Hookline's workers call our own internal services
 
 import ipaddress
 import socket
+from collections.abc import Collection
 from urllib.parse import urlsplit
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -22,18 +23,23 @@ class UnresolvableHostError(UnsafeURLError):
     """DNS gave no answer. Unlike a private address, this can fix itself, so it's retryable."""
 
 
-def ensure_public_url(url: str, *, allow_loopback: bool = False) -> None:
+def ensure_public_url(
+    url: str, *, allow_loopback: bool = False, allowed_hosts: Collection[str] = ()
+) -> None:
     """Raise UnsafeURLError unless every address the URL's host resolves to is public.
 
     allow_loopback (DEBUG only) additionally permits localhost, 127.0.0.0/8 and ::1.
+    allowed_hosts are hostnames trusted whatever they resolve to (ALLOWED_INTERNAL_HOSTS).
 
     This alone is a registration-time check. DNS can change afterwards (rebinding), so the
     delivery worker uses resolve_public_addresses and connects only to addresses it checked.
     """
-    resolve_public_addresses(url, allow_loopback=allow_loopback)
+    resolve_public_addresses(url, allow_loopback=allow_loopback, allowed_hosts=allowed_hosts)
 
 
-def resolve_public_addresses(url: str, *, allow_loopback: bool = False) -> list[IPAddress]:
+def resolve_public_addresses(
+    url: str, *, allow_loopback: bool = False, allowed_hosts: Collection[str] = ()
+) -> list[IPAddress]:
     """Check the URL like ensure_public_url and return its addresses, in resolver order."""
     parts = urlsplit(url)
     host = parts.hostname
@@ -47,7 +53,11 @@ def resolve_public_addresses(url: str, *, allow_loopback: bool = False) -> list[
     addresses = _resolve(host, port)
     if not addresses:
         raise UnresolvableHostError("URL host could not be resolved")
+    # hostname is lowercase. The whole name is trusted, so its addresses aren't checked.
+    trusted = host in allowed_hosts
     for address in addresses:
+        if trusted:
+            continue
         if _is_public(address):
             continue
         if allow_loopback and _unwrap(address).is_loopback:

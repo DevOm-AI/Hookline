@@ -57,6 +57,32 @@ services:
       celery -A app.workers.celery_app:celery_app beat --loglevel=info
       --schedule /tmp/celerybeat-schedule
 
+  # A test tool, not part of Hookline: the webhook receiver for load and chaos tests.
+  # Only started when asked for: docker compose up -d receiver
+  receiver:
+    image: hookline:dev
+    build: .
+    profiles: [receiver]
+    command: uvicorn receiver.main:app --host 0.0.0.0 --port 9000
+    environment:
+      RECEIVER_SECRET: ${RECEIVER_SECRET:-}
+      RECEIVER_FAIL_PERCENT: ${RECEIVER_FAIL_PERCENT:-0}
+      RECEIVER_DELAY_MS: ${RECEIVER_DELAY_MS:-0}
+    volumes:
+      - ./receiver:/app/receiver
+    ports:
+      - "${RECEIVER_HOST_PORT:-9000}:9000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:

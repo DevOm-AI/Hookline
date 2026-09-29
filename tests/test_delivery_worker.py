@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx2
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import delete, func, select, update
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session, sessionmaker
@@ -28,6 +29,8 @@ from app.workers.delivery import (
 )
 from app.workers.scheduler import LOCK_DURATION, claim_due_deliveries
 from app.workers.sweeper import release_stuck_deliveries
+from receiver.main import Behaviour
+from receiver.main import create_app as create_receiver_app
 
 PAYLOAD = {"order_id": 42, "note": "café"}
 SECRET = "whsec_x"
@@ -338,6 +341,42 @@ def test_host_that_now_resolves_internally_is_blocked(
     [attempt] = attempts_for(db, delivery)
     assert attempt.status_code is None
     assert attempt.error.startswith("Blocked:")
+
+
+def test_allowed_internal_host_is_delivered_to(
+    db: Session, settings: Settings, receiver: Receiver, dns: dict[str, list[str]]
+):
+    dns["receiver"] = ["172.18.0.5"]
+    settings.allowed_internal_hosts = ["receiver"]
+    delivery = add_delivery(db, url="http://receiver:9000/webhook")
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    [request] = receiver.requests
+    assert request.url == "http://172.18.0.5:9000/webhook"
+    assert request.headers["Host"] == "receiver:9000"
+
+
+def test_mock_receiver_verifies_what_the_worker_sends(
+    db: Session, receiver: Receiver, dns: dict[str, list[str]]
+):
+    """The worker's signed request, answered by the real mock receiver app."""
+    mock = TestClient(create_receiver_app(Behaviour(_env_file=None, secret=SECRET)))
+
+    def forward(request: httpx2.Request) -> httpx2.Response:
+        answer = mock.post("/webhook", content=request.content, headers=dict(request.headers))
+        return httpx2.Response(answer.status_code)
+
+    receiver.handler = forward
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    received = mock.get("/received").json()
+    assert received[str(delivery.event_id)]["delivered"] == 1
+    assert mock.get("/stats").json()["rejected"] == 0
 
 
 def test_host_that_no_longer_resolves_is_retried(

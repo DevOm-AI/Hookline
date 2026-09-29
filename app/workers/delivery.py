@@ -205,7 +205,10 @@ def _pin_addresses(raw_url: str) -> tuple[list[httpx2.URL], str, dict[str, str]]
     goes in the Host header and in TLS SNI, so virtual hosts and certificate checks work.
     """
     url = httpx2.URL(raw_url)
-    addresses = resolve_public_addresses(raw_url, allow_loopback=get_settings().debug)
+    settings = get_settings()
+    addresses = resolve_public_addresses(
+        raw_url, allow_loopback=settings.debug, allowed_hosts=settings.allowed_internal_hosts
+    )
     # raw_host: the ASCII (punycode) form a TLS handshake needs.
     sni = url.raw_host.decode("ascii")
     extensions = {"sni_hostname": sni} if url.scheme == "https" else {}

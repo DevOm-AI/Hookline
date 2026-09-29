@@ -107,3 +107,23 @@ def test_resolve_public_addresses_applies_the_same_checks(dns: dict[str, list[st
 
     with pytest.raises(UnsafeURLError, match="private or internal"):
         resolve_public_addresses("https://example.com/hook")
+
+
+def test_allowed_hosts_may_resolve_to_private_addresses(dns: dict[str, list[str]]):
+    """ALLOWED_INTERNAL_HOSTS: e.g. the docker compose mock receiver."""
+    dns["receiver"] = ["172.18.0.5"]
+
+    addresses = resolve_public_addresses("http://receiver:9000/webhook", allowed_hosts=["receiver"])
+
+    assert [str(a) for a in addresses] == ["172.18.0.5"]
+
+
+@pytest.mark.parametrize(
+    "host", ["receiver.example.com", "evil-receiver", "receiver.", "172.18.0.5", "10.0.0.5"]
+)
+def test_allowed_hosts_match_exact_names_only(dns: dict[str, list[str]], host: str):
+    dns.update({name: ["172.18.0.5"] for name in ["receiver.example.com", "evil-receiver"]})
+    dns["receiver."] = ["172.18.0.5"]
+
+    with pytest.raises(UnsafeURLError, match="private or internal"):
+        ensure_public_url(f"http://{host}:9000/webhook", allowed_hosts=["receiver"])
