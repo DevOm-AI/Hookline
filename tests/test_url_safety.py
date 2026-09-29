@@ -1,6 +1,11 @@
 import pytest
 
-from app.core.url_safety import UnsafeURLError, ensure_public_url, resolve_public_addresses
+from app.core.url_safety import (
+    UnresolvableHostError,
+    UnsafeURLError,
+    ensure_public_url,
+    resolve_public_addresses,
+)
 
 BLOCKED_HOSTS = [
     "127.0.0.1",  # loopback
@@ -57,8 +62,17 @@ def test_blocks_hostname_when_any_address_is_private(dns: dict[str, list[str]]):
 
 
 def test_blocks_unresolvable_host():
-    with pytest.raises(UnsafeURLError, match="could not be resolved"):
+    # UnresolvableHostError: DNS can recover, so the delivery worker retries these.
+    with pytest.raises(UnresolvableHostError, match="could not be resolved"):
         ensure_public_url("https://does-not-exist.invalid/hook")
+
+
+def test_invalid_hostname_is_not_just_unresolvable():
+    """No DNS answer will ever fix it, so it must not be treated as retryable."""
+    with pytest.raises(UnsafeURLError, match="not a valid hostname") as caught:
+        ensure_public_url(f"https://{'a' * 70}.com/hook")
+
+    assert not isinstance(caught.value, UnresolvableHostError)
 
 
 @pytest.mark.parametrize("url", ["https:///hook", "https://example.com:99999/hook"])

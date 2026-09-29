@@ -83,8 +83,22 @@ not followed) with these headers:
 | `Hookline-Signature` | `t=<unix time>,v1=<hex HMAC-SHA256>`, see [Verifying signatures](#verifying-signatures) |
 
 Every try is logged in `delivery_attempts` with its status code, time taken and error. A
-2xx marks the delivery `succeeded`. Retries don't exist yet, so any other response,
-a timeout or a connection error marks it `dead`.
+2xx marks the delivery `succeeded`.
+
+### Retries
+
+A timeout, connection error, DNS failure, 5xx or 429 is retried with backoff. The delivery
+goes back to `pending` with a later `next_attempt_at`, and the scheduler picks it up again
+then:
+
+| Attempt | 1 | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- | --- |
+| Wait before the next try | 10 s | 1 min | 5 min | 30 min | `dead` |
+
+Each wait gets ±20% random jitter, so deliveries that failed together don't all retry in the
+same second. Any other response (3xx, other 4xx) means the request itself is wrong, so the
+delivery is marked `dead` straight away, as is an endpoint that now resolves to an internal
+address. Each retry is signed again with its own timestamp.
 
 The endpoint's host is resolved and checked again at send time, and the worker connects to
 exactly the address it checked. A name that has since started pointing at an internal

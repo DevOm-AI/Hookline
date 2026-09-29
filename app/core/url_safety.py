@@ -18,6 +18,10 @@ class UnsafeURLError(ValueError):
     """The URL must not be called: it is malformed, unresolvable or not public."""
 
 
+class UnresolvableHostError(UnsafeURLError):
+    """DNS gave no answer. Unlike a private address, this can fix itself, so it's retryable."""
+
+
 def ensure_public_url(url: str, *, allow_loopback: bool = False) -> None:
     """Raise UnsafeURLError unless every address the URL's host resolves to is public.
 
@@ -42,7 +46,7 @@ def resolve_public_addresses(url: str, *, allow_loopback: bool = False) -> list[
 
     addresses = _resolve(host, port)
     if not addresses:
-        raise UnsafeURLError("URL host could not be resolved")
+        raise UnresolvableHostError("URL host could not be resolved")
     for address in addresses:
         if _is_public(address):
             continue
@@ -56,8 +60,11 @@ def resolve_public_addresses(url: str, *, allow_loopback: bool = False) -> list[
 def _resolve(host: str, port: int) -> list[IPAddress]:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except (socket.gaierror, UnicodeError) as exc:
-        raise UnsafeURLError("URL host could not be resolved") from exc
+    except socket.gaierror as exc:
+        raise UnresolvableHostError("URL host could not be resolved") from exc
+    except UnicodeError as exc:
+        # Not a valid (IDNA) hostname at all: no DNS answer will ever change that.
+        raise UnsafeURLError("URL host is not a valid hostname") from exc
     # sockaddr[0] may carry an IPv6 zone id ("fe80::1%eth0"); it is never public anyway.
     return [ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos]
 

@@ -3,11 +3,12 @@ import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx2
 import pytest
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core import signing
@@ -16,7 +17,15 @@ from app.core.signing import verify_signature
 from app.models import Delivery, DeliveryAttempt, DeliveryStatus, Endpoint, Event
 from app.workers import delivery as worker
 from app.workers.celery_app import celery_app
-from app.workers.delivery import MAX_ERROR_BODY_BYTES, Outgoing, deliver
+from app.workers.delivery import (
+    MAX_ATTEMPTS,
+    MAX_ERROR_BODY_BYTES,
+    RETRY_DELAYS,
+    Outgoing,
+    deliver,
+    retry_delay,
+)
+from app.workers.scheduler import claim_due_deliveries
 
 PAYLOAD = {"order_id": 42, "note": "café"}
 SECRET = "whsec_x"
@@ -151,6 +160,7 @@ def test_every_try_is_signed_with_the_time_it_was_sent(
 def test_secret_stays_out_of_logs():
     outgoing = Outgoing(
         url="https://example.com/hook",
+        attempt_count=0,
         secret="whsec_do_not_log",
         event_id=uuid.uuid4(),
         event_type="order.shipped",
@@ -209,7 +219,8 @@ def test_fails_when_every_address_is_unreachable(
     run(db, delivery)
 
     assert len(receiver.requests) == 2
-    assert delivery.status == DeliveryStatus.DEAD
+    # One attempt, not two: the addresses are one host, and trying again later may work.
+    assert delivery.status == DeliveryStatus.PENDING
     [attempt] = attempts_for(db, delivery)
     assert attempt.status_code is None
     assert attempt.error == "ConnectError: refused by 93.184.215.15"
@@ -226,13 +237,12 @@ def test_a_response_from_one_address_is_final(
     run(db, delivery)
 
     assert len(receiver.requests) == 1
-    assert delivery.status == DeliveryStatus.DEAD
+    assert delivery.attempt_count == 1
 
 
-@pytest.mark.parametrize("status_code", [400, 404, 429, 500, 503])
-def test_non_2xx_marks_delivery_dead_with_the_response(
-    db: Session, receiver: Receiver, status_code: int
-):
+@pytest.mark.parametrize("status_code", [301, 400, 401, 404, 410, 422])
+def test_other_non_2xx_is_dead_straight_away(db: Session, receiver: Receiver, status_code: int):
+    """The request itself is wrong: sending it again would get the same answer."""
     receiver.handler = lambda request: httpx2.Response(status_code, text="receiver says no")
     delivery = add_delivery(db)
 
@@ -240,6 +250,22 @@ def test_non_2xx_marks_delivery_dead_with_the_response(
 
     assert delivery.status == DeliveryStatus.DEAD
     assert delivery.attempt_count == 1
+    assert delivery.locked_until is None
+    [attempt] = attempts_for(db, delivery)
+    assert attempt.status_code == status_code
+    assert attempt.error == f"HTTP {status_code}: receiver says no"
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+def test_5xx_and_429_are_retried(db: Session, receiver: Receiver, status_code: int):
+    receiver.handler = lambda request: httpx2.Response(status_code, text="receiver says no")
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.PENDING
+    assert delivery.attempt_count == 1
+    assert delivery.locked_until is None
     [attempt] = attempts_for(db, delivery)
     assert attempt.status_code == status_code
     assert attempt.error == f"HTTP {status_code}: receiver says no"
@@ -286,7 +312,7 @@ def test_network_failure_is_logged_without_status_code(
 
     run(db, delivery)
 
-    assert delivery.status == DeliveryStatus.DEAD
+    assert delivery.status == DeliveryStatus.PENDING
     [attempt] = attempts_for(db, delivery)
     assert attempt.status_code is None
     assert attempt.error == error
@@ -306,6 +332,19 @@ def test_host_that_now_resolves_internally_is_blocked(
     [attempt] = attempts_for(db, delivery)
     assert attempt.status_code is None
     assert attempt.error.startswith("Blocked:")
+
+
+def test_host_that_no_longer_resolves_is_retried(
+    db: Session, receiver: Receiver, dns: dict[str, list[str]]
+):
+    """A DNS outage can fix itself, unlike an internal address."""
+    delivery = add_delivery(db, url="https://gone.example.com/hook")
+
+    run(db, delivery)
+
+    assert receiver.requests == []
+    assert delivery.status == DeliveryStatus.PENDING
+    assert attempts_for(db, delivery)[0].error == "URL host could not be resolved"
 
 
 @pytest.mark.parametrize(
@@ -364,36 +403,47 @@ def test_tasks_are_acked_only_after_they_finish():
     assert celery_app.conf.worker_prefetch_multiplier == 1
 
 
+class LocalReceiver:
+    """A real HTTP server on 127.0.0.1. Answers `fail_with` in order, then 204 for good."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.received: list[dict] = []
+        self.fail_with: list[int] = []
+
+
 @pytest.fixture
-def local_receiver() -> Iterator[tuple[int, list[dict]]]:
-    """A real HTTP server on 127.0.0.1, answering 204 and recording what it got."""
-    received: list[dict] = []
+def local_receiver() -> Iterator[LocalReceiver]:
+    receiver: LocalReceiver
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers["Content-Length"]))
-            received.append({"path": self.path, "headers": dict(self.headers), "body": body})
-            self.send_response(204)
+            receiver.received.append(
+                {"path": self.path, "headers": dict(self.headers), "body": body}
+            )
+            self.send_response(receiver.fail_with.pop(0) if receiver.fail_with else 204)
             self.end_headers()
 
         def log_message(self, *args) -> None:
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    receiver = LocalReceiver(server.server_address[1])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield server.server_address[1], received
+        yield receiver
     finally:
         server.shutdown()
         server.server_close()
 
 
 def test_delivers_over_a_real_connection(
-    db: Session, settings: Settings, local_receiver: tuple[int, list[dict]]
+    db: Session, settings: Settings, local_receiver: LocalReceiver
 ):
     """No mock transport: the pinned-address request really goes over a socket."""
-    port, received = local_receiver
+    port, received = local_receiver.port, local_receiver.received
     settings.debug = True  # loopback receivers are allowed only with DEBUG
     delivery = add_delivery(db, url=f"http://localhost:{port}/hook")
 
@@ -409,13 +459,129 @@ def test_delivers_over_a_real_connection(
     assert verify_signature(SECRET, request["body"], request["headers"]["Hookline-Signature"])
 
 
-def test_loopback_receiver_is_blocked_without_debug(
-    db: Session, local_receiver: tuple[int, list[dict]]
-):
-    port, received = local_receiver
+def test_loopback_receiver_is_blocked_without_debug(db: Session, local_receiver: LocalReceiver):
+    port, received = local_receiver.port, local_receiver.received
     delivery = add_delivery(db, url=f"http://localhost:{port}/hook")
 
     run(db, delivery)
 
     assert received == []
     assert delivery.status == DeliveryStatus.DEAD
+
+
+def db_now(db: Session) -> datetime:
+    # Tests run in one transaction, so now() is the same instant for the test and the worker.
+    return db.scalar(select(func.now()))
+
+
+@pytest.mark.parametrize(
+    ("previous_attempts", "wait"),
+    [(0, timedelta(seconds=10)), (1, timedelta(minutes=1)), (2, timedelta(minutes=5))]
+    + [(3, timedelta(minutes=30))],
+)
+def test_retry_waits_follow_the_backoff_table(
+    db: Session,
+    receiver: Receiver,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_attempts: int,
+    wait: timedelta,
+):
+    monkeypatch.setattr(worker.random, "uniform", lambda low, high: 1.0)
+    receiver.handler = lambda request: httpx2.Response(503)
+    delivery = add_delivery(db)
+    delivery.attempt_count = previous_attempts
+    db.flush()
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.PENDING
+    assert delivery.attempt_count == previous_attempts + 1
+    assert delivery.next_attempt_at - db_now(db) == wait
+
+
+@pytest.mark.parametrize("factor", [0.8, 1.2])
+def test_retry_wait_is_jittered(
+    db: Session, receiver: Receiver, monkeypatch: pytest.MonkeyPatch, factor: float
+):
+    monkeypatch.setattr(worker.random, "uniform", lambda low, high: factor)
+    receiver.handler = lambda request: httpx2.Response(503)
+    delivery = add_delivery(db)
+
+    run(db, delivery)
+
+    assert delivery.next_attempt_at - db_now(db) == timedelta(seconds=10) * factor
+
+
+@pytest.mark.parametrize("attempt", range(1, MAX_ATTEMPTS))
+def test_jitter_stays_within_20_percent(attempt: int):
+    base = RETRY_DELAYS[attempt - 1]
+    delays = [retry_delay(attempt) for _ in range(1000)]
+
+    assert all(base * 0.8 <= delay <= base * 1.2 for delay in delays)
+    # Actually spread out, not one fixed value.
+    assert len(set(delays)) > 900
+    assert min(delays) < base * 0.9 and max(delays) > base * 1.1
+
+
+def test_fifth_failure_is_dead(db: Session, receiver: Receiver):
+    assert MAX_ATTEMPTS == 5
+    receiver.handler = lambda request: httpx2.Response(503)
+    delivery = add_delivery(db)
+    delivery.attempt_count = MAX_ATTEMPTS - 1
+    db.flush()
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.DEAD
+    assert delivery.attempt_count == MAX_ATTEMPTS
+    assert delivery.locked_until is None
+
+
+def test_failing_receiver_gets_five_tries_then_dead(db: Session, receiver: Receiver):
+    receiver.handler = lambda request: httpx2.Response(500)
+    delivery = add_delivery(db)
+
+    for _ in range(MAX_ATTEMPTS):
+        db.execute(
+            update(Delivery)
+            .where(Delivery.id == delivery.id)
+            .values(status=DeliveryStatus.IN_PROGRESS)
+        )
+        run(db, delivery)
+
+    assert len(receiver.requests) == MAX_ATTEMPTS
+    assert delivery.status == DeliveryStatus.DEAD
+    assert [a.status_code for a in attempts_for(db, delivery)] == [500] * MAX_ATTEMPTS
+
+
+def test_receiver_failing_twice_gets_the_event_on_the_third_try(
+    db: Session, settings: Settings, local_receiver: LocalReceiver
+):
+    """The guide's "done when": scheduler and worker together, over a real connection."""
+    settings.debug = True  # loopback receivers are allowed only with DEBUG
+    local_receiver.fail_with = [503, 503]
+    delivery = add_delivery(db, url=f"http://localhost:{local_receiver.port}/hook")
+    delivery.status = DeliveryStatus.PENDING
+    db.flush()
+
+    for _ in range(3):
+        assert claim_due_deliveries(db) == [delivery.id]
+        worker.send_delivery(delivery.id)
+        db.expire_all()
+        if delivery.status == DeliveryStatus.PENDING:
+            # Waiting for the retry: not due yet, so the scheduler leaves it alone...
+            assert claim_due_deliveries(db) == []
+            # ...until its time comes. Jump there instead of sleeping.
+            db.execute(
+                update(Delivery)
+                .where(Delivery.id == delivery.id)
+                .values(next_attempt_at=func.now() - timedelta(seconds=1))
+            )
+
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    assert delivery.attempt_count == 3
+    assert [a.status_code for a in attempts_for(db, delivery)] == [503, 503, 204]
+    assert len(local_receiver.received) == 3
+    final = local_receiver.received[-1]
+    assert json.loads(final["body"]) == PAYLOAD
+    assert verify_signature(SECRET, final["body"], final["headers"]["Hookline-Signature"])
