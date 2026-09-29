@@ -1,6 +1,6 @@
 import os
 import socket
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
@@ -36,6 +36,9 @@ def alembic_config(connection: Connection) -> Config:
 
 def _create_database_if_missing(url: str) -> None:
     db_url = make_url(url)
+    # SKIP LOCKED, ON CONFLICT, JSONB and arrays are what these tests check; SQLite has none.
+    if db_url.get_backend_name() != "postgresql":
+        raise RuntimeError(f"TEST_DATABASE_URL must be a Postgres URL, got {db_url.drivername!r}")
     # Guard: migrations get rolled back and forth here, so never point this at a real database.
     if not db_url.database or not db_url.database.endswith("_test"):
         raise RuntimeError(
@@ -87,10 +90,20 @@ def db(engine: Engine) -> Iterator[Session]:
 TEST_API_KEY = "hk_test_key"
 
 
+def _api_client(get_test_db: Callable[[], Iterator[Session]]) -> Iterator[TestClient]:
+    """API client sending a valid API key, with sessions from get_test_db."""
+    settings = Settings(_env_file=None, api_key_hash=hash_api_key(TEST_API_KEY))
+    app.dependency_overrides[get_db] = get_test_db
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
+    finally:
+        app.dependency_overrides.clear()
+
+
 @pytest.fixture
 def client(db: Session) -> Iterator[TestClient]:
-    """API client sending a valid API key, using the rolled-back test session."""
-    settings = Settings(_env_file=None, api_key_hash=hash_api_key(TEST_API_KEY))
+    """API client using the rolled-back test session."""
 
     def get_test_db() -> Iterator[Session]:
         # Like get_db closing its session: whatever a request didn't commit is discarded.
@@ -99,12 +112,23 @@ def client(db: Session) -> Iterator[TestClient]:
         finally:
             db.rollback()
 
-    app.dependency_overrides[get_db] = get_test_db
-    app.dependency_overrides[get_settings] = lambda: settings
-    try:
-        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
-    finally:
-        app.dependency_overrides.clear()
+    yield from _api_client(get_test_db)
+
+
+@pytest.fixture
+def committed_client(engine: Engine) -> Iterator[TestClient]:
+    """API client whose requests each get their own session and really commit.
+
+    For tests where requests run at the same time and must see each other's transactions.
+    Nothing is rolled back: the test deletes what it created.
+    """
+    make_session = sessionmaker(bind=engine)
+
+    def get_test_db() -> Iterator[Session]:
+        with make_session() as session:
+            yield session
+
+    yield from _api_client(get_test_db)
 
 
 @pytest.fixture(autouse=True)
@@ -137,3 +161,10 @@ def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     return records
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark every test that needs Postgres, so `pytest -m "not integration"` runs without it."""
+    for item in items:
+        if "engine" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.integration)

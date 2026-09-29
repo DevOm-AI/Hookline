@@ -371,5 +371,12 @@ uv run pytest
 ```
 
 By default tests connect to the compose Postgres at `localhost:5433`. To use a different
-server, set `TEST_DATABASE_URL` in your shell (it is not read from `.env`); the database
-name must end in `_test`.
+server, set `TEST_DATABASE_URL` in your shell (it is not read from `.env`); it must be a
+Postgres URL (SQLite has no `SKIP LOCKED`) and the database name must end in `_test`.
+
+Tests that need Postgres are marked `integration` automatically. To run only the unit
+tests (signatures, retry rules, backoff, URL checks), with no database:
+
+```bash
+uv run pytest -m "not integration"
+```
