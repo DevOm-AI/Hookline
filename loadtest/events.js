@@ -26,8 +26,10 @@ export const options = {
       rate: RATE,
       timeUnit: "1s",
       duration: DURATION,
-      preAllocatedVUs: Math.max(10, RATE),
-      maxVUs: RATE * 4,
+      // Enough VUs up front for requests taking up to 2 s: starting more mid-run is slow,
+      // and k6 drops the requests it has no VU for meanwhile.
+      preAllocatedVUs: Math.max(10, RATE * 2),
+      maxVUs: RATE * 10,
     },
   },
   summaryTrendStats: ["avg", "med", "p(95)", "p(99)", "max"],

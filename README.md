@@ -440,6 +440,53 @@ Every accepted event was delivered at every rate, but no rate met p95 under one 
 - **At 100/s and above the API is saturated too:** `POST /events` slows to seconds and k6
   can't hold the rate. Every process here shares 2 cores.
 
+## Chaos test
+
+The headline claim: kill workers mid-delivery and no event is lost.
+[scripts/chaos_test.sh](scripts/chaos_test.sh) starts 3 workers and the
+[mock receiver](#mock-receiver) failing 20% of requests. While k6 sends 10,000 events, a
+random worker is killed with `docker kill` (SIGKILL: no graceful shutdown, deliveries cut off
+mid-request) every 20 seconds and started again 5 seconds later. At the end, the event ids the
+receiver answered 2xx must be exactly the events Hookline accepted.
+
+```bash
+scripts/chaos_test.sh                  # 10,000 events at 50/s
+EVENTS=1000 scripts/chaos_test.sh      # a quicker run
+```
+
+`WORKERS`, `KILL_EVERY`, `RATE` and `FAIL_PERCENT` can be set the same way. It exits 1 if
+any event was lost, and also if the test didn't happen as asked, since zero lost then proves
+little: k6 dropped requests, the API refused some, fewer than `EVENTS` were accepted, or no
+worker was killed. It leaves the stack running with one worker, and exits 1 if it can't.
+
+At 20% failures, about 16 in 10,000 events fail four times in a row, and their fifth try is
+30 minutes later; a few fail that too and go dead. Rather than wait, the test lets retries run
+as scheduled for 90 seconds, then settles the rest with workers still dying and the receiver
+still failing: waiting retries are made due at once, and dead deliveries are replayed as
+`POST /endpoints/{id}/replay-dead` would. That changes when they go out, not whether; the
+report says how many it touched.
+
+### Results
+
+Measured 2026-09-29 on the same laptop as the [load test](#load-test) (2 cores), default
+settings: 3 workers of 4 processes each, 50 events/s, a worker killed every 20 seconds.
+
+| | |
+| --- | --- |
+| Events sent (accepted) | 10,001 (k6 dropped none) |
+| **Events lost** | **0**: all 10,001 event ids reached the receiver |
+| Workers killed (SIGKILL) | 11 |
+| Receiver 500s on purpose | 2,415 of 12,418 requests |
+| Duplicates | 2 |
+| First-attempt latency | p50 888 ms, p95 1220 ms, p99 1899 ms |
+| Accepted under chaos | 50 events/s for 200 s |
+| Left to settle | 92 pending after 90 s; 114 retry waits skipped, 5 dead replayed |
+
+The 2 duplicates are [at-least-once delivery](#at-least-once-delivery) at work: a worker died
+after the receiver got the request but before the result was saved, so it was sent again.
+An earlier run, where k6 dropped 52 requests, also ended with every accepted event (9,949)
+delivered.
+
 ## Tests and lint
 
 Tests run against a real Postgres, in a separate `hookline_test` database that is
