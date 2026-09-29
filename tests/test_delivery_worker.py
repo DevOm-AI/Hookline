@@ -25,7 +25,7 @@ from app.workers.delivery import (
     deliver,
     retry_delay,
 )
-from app.workers.scheduler import claim_due_deliveries
+from app.workers.scheduler import LOCK_DURATION, claim_due_deliveries
 from app.workers.sweeper import release_stuck_deliveries
 
 PAYLOAD = {"order_id": 42, "note": "café"}
@@ -88,6 +88,8 @@ def add_delivery(
     db.add_all([endpoint, event])
     db.flush()
     delivery = Delivery(event_id=event.id, endpoint_id=endpoint.id, status=status)
+    if status == DeliveryStatus.IN_PROGRESS:
+        delivery.locked_until = db.scalar(select(func.now())) + LOCK_DURATION
     db.add(delivery)
     db.flush()
     db.refresh(delivery)
@@ -162,6 +164,7 @@ def test_secret_stays_out_of_logs():
     outgoing = Outgoing(
         url="https://example.com/hook",
         attempt_count=0,
+        locked_until=None,
         secret="whsec_do_not_log",
         event_id=uuid.uuid4(),
         event_type="order.shipped",
@@ -396,6 +399,77 @@ def test_delivery_deleted_during_the_request_is_not_recorded(db: Session, receiv
 
     assert db.scalars(select(Delivery).where(Delivery.id == delivery_id)).all() == []
     assert db.scalars(select(DeliveryAttempt)).all() == []
+
+
+def set_mid_request(db: Session, delivery: Delivery, **values: object) -> Handler:
+    """A receiver that answers 500, after something else changed the delivery meanwhile."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        db.execute(update(Delivery).where(Delivery.id == delivery.id).values(**values))
+        return httpx2.Response(500)
+
+    return handler
+
+
+def test_result_is_dropped_once_the_sweeper_released_the_delivery(db: Session, receiver: Receiver):
+    """The request outlived the lock; the sweeper handed the delivery back meanwhile."""
+    delivery = add_delivery(db)
+    receiver.handler = set_mid_request(
+        db, delivery, status=DeliveryStatus.PENDING, locked_until=None
+    )
+
+    run(db, delivery)
+
+    assert len(receiver.requests) == 1
+    assert delivery.status == DeliveryStatus.PENDING
+    assert delivery.attempt_count == 0
+    assert attempts_for(db, delivery) == []
+
+
+def test_result_never_overwrites_a_newer_claim(db: Session, receiver: Receiver):
+    """Released and claimed again by another worker: in_progress again, but not ours."""
+    delivery = add_delivery(db)
+    # A later claim's lock. Here it's the same transaction, so now() alone wouldn't differ.
+    new_lock = delivery.locked_until + timedelta(seconds=30)
+    receiver.handler = set_mid_request(db, delivery, locked_until=new_lock)
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.IN_PROGRESS
+    assert delivery.locked_until == new_lock
+    assert delivery.attempt_count == 0
+    assert attempts_for(db, delivery) == []
+
+
+def test_result_never_overwrites_one_saved_by_another_worker(db: Session, receiver: Receiver):
+    delivery = add_delivery(db)
+    receiver.handler = set_mid_request(
+        db, delivery, status=DeliveryStatus.SUCCEEDED, attempt_count=2, locked_until=None
+    )
+
+    run(db, delivery)
+
+    # The 500 this worker got doesn't turn the success back into a retry.
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    assert delivery.attempt_count == 2
+    assert attempts_for(db, delivery) == []
+
+
+def test_result_is_saved_when_the_lock_expired_but_nobody_took_over(
+    db: Session, receiver: Receiver
+):
+    delivery = add_delivery(db)
+    db.execute(
+        update(Delivery)
+        .where(Delivery.id == delivery.id)
+        .values(locked_until=func.now() - timedelta(seconds=1))
+    )
+
+    run(db, delivery)
+
+    assert delivery.status == DeliveryStatus.SUCCEEDED
+    assert delivery.attempt_count == 1
+    assert len(attempts_for(db, delivery)) == 1
 
 
 def test_tasks_are_acked_only_after_they_finish():
