@@ -33,6 +33,11 @@ uv run python -m app.core.security
 
 ## Endpoints
 
+Endpoint URLs must resolve only to public addresses. Private, loopback, link-local
+(including `169.254.169.254`) and other internal addresses are rejected with 422, so
+Hookline can't be pointed at internal services. With `DEBUG=true`, `localhost` is allowed
+for local testing.
+
 ```bash
 # Register an endpoint. The response includes its signing secret, shown only this once.
 curl -X POST localhost:8000/endpoints \

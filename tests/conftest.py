@@ -1,4 +1,5 @@
 import os
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -104,3 +105,31 @@ def client(db: Session) -> Iterator[TestClient]:
         yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Fake DNS so no test depends on the network. Add names to the returned dict.
+
+    Unknown names fail to resolve; IP literals (including forms like 2130706433) still
+    resolve, through getaddrinfo in numeric-only mode.
+    """
+    records = {"example.com": ["93.184.215.14"], "localhost": ["127.0.0.1", "::1"]}
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host in records:
+            return [
+                (
+                    socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    (ip, port),
+                )
+                for ip in records[host]
+            ]
+        return real_getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    return records
