@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
@@ -30,6 +31,26 @@ def test_broker_url_can_be_overridden(monkeypatch):
     monkeypatch.setenv("CELERY_BROKER_URL", "redis://broker:6379/2")
 
     assert Settings(_env_file=None).broker_url == "redis://broker:6379/2"
+
+
+@pytest.mark.parametrize(
+    ("value", "hosts"),
+    [
+        ("", []),
+        ("receiver:9000", ["receiver:9000"]),
+        (" Receiver:9000 , mock ,", ["receiver:9000", "mock"]),
+    ],
+)
+def test_allowed_internal_hosts_are_comma_separated(monkeypatch, value: str, hosts: list[str]):
+    monkeypatch.setenv("ALLOWED_INTERNAL_HOSTS", value)
+
+    assert Settings(_env_file=None).allowed_internal_hosts == hosts
+
+
+def test_no_internal_hosts_are_allowed_by_default(monkeypatch):
+    monkeypatch.delenv("ALLOWED_INTERNAL_HOSTS", raising=False)
+
+    assert Settings(_env_file=None).allowed_internal_hosts == []
 
 
 def test_app_serves_docs():

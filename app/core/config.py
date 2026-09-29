@@ -1,8 +1,8 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     environment: Literal["local", "test", "production"] = "local"
     # Loosens local-only checks, e.g. allowing localhost endpoint URLs.
     debug: bool = False
+    # Endpoint hosts allowed to resolve to private addresses, comma-separated: "host:port" for
+    # one port (e.g. "receiver:9000", the docker compose mock receiver), "host" for any port.
+    # Exact names only, and only ones your own DNS answers for: their addresses aren't checked.
+    allowed_internal_hosts: Annotated[list[str], NoDecode] = []
 
     database_url: str = "postgresql+psycopg://hookline:hookline@localhost:5433/hookline"
     redis_url: str = "redis://localhost:6380/0"
@@ -22,6 +26,13 @@ class Settings(BaseSettings):
     # SHA-256 hex digest of the API key; the key itself is never stored.
     # Generate a pair with `uv run python -m app.core.security`. Unset = every API call is 401.
     api_key_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("allowed_internal_hosts", mode="before")
+    @classmethod
+    def _split_hosts(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [host.strip().lower() for host in value.split(",") if host.strip()]
+        return value
 
     @property
     def broker_url(self) -> str:

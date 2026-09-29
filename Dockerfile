@@ -1,4 +1,4 @@
-# One image for the api, worker and beat services.
+# One image for the api, worker and beat services (and the mock receiver).
 FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
@@ -20,6 +20,7 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY app ./app
 COPY alembic.ini ./
 COPY alembic ./alembic
+COPY receiver ./receiver
 
 RUN useradd --create-home --uid 1000 hookline
 USER hookline

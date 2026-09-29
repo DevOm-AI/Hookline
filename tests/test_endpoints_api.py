@@ -134,6 +134,23 @@ def test_create_allows_localhost_only_in_debug(client: TestClient):
     assert response.status_code == 422
 
 
+def test_create_allows_internal_hosts_only_when_listed(
+    client: TestClient, dns: dict[str, list[str]]
+):
+    dns["receiver"] = ["172.18.0.5"]
+    url = "http://receiver:9000/webhook"
+    assert client.post("/endpoints", json=NEW_ENDPOINT | {"url": url}).status_code == 422
+
+    allowed = Settings(
+        _env_file=None,
+        api_key_hash=hash_api_key(TEST_API_KEY),
+        allowed_internal_hosts=["receiver:9000"],
+    )
+    app.dependency_overrides[get_settings] = lambda: allowed
+
+    assert create(client, url=url)["url"] == url
+
+
 # --- read ---
 
 

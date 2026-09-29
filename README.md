@@ -358,6 +358,44 @@ New migration files land in `alembic/versions/`. Format and review them before c
 uv run ruff format alembic/versions && uv run ruff check alembic/versions
 ```
 
+## Mock receiver
+
+A webhook receiver for load and chaos tests, in [receiver/](receiver/). It verifies each
+request's signature, records every `Hookline-Event-Id`, and can be told to fail a share of
+requests (with a 500, which Hookline retries) or to answer slowly. A test tool: its control
+routes have no auth, so compose publishes it on `127.0.0.1` only. Never expose it.
+
+```bash
+docker compose up -d receiver
+```
+
+Its address, `http://receiver:9000/webhook`, is private, so workers reach it only because
+`.env` lists `receiver:9000` in `ALLOWED_INTERNAL_HOSTS` (see `.env.example`). An entry is
+`host:port`, or `host` for any port; its addresses aren't checked, so list only names your
+own DNS answers for, like compose service names. Register it, then give it the secret
+Hookline returned:
+
+```bash
+curl -s -X POST localhost:8000/endpoints -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://receiver:9000/webhook", "event_types": ["order.shipped"]}'
+
+curl -s -X PATCH localhost:9000/config -H "Content-Type: application/json" \
+  -d '{"secret": "whsec_...", "fail_percent": 20, "delay_ms": 0}'
+```
+
+| Route | |
+| --- | --- |
+| `POST /webhook` | 401 on a bad or old signature, else waits `delay_ms`, then 500 for `fail_percent`% of requests, 204 for the rest |
+| `GET` / `PATCH /config` | `secret`, `fail_percent` (0–100), `delay_ms` (0–60000); also `RECEIVER_*` env vars at start |
+| `GET /stats` | Requests, rejected, failed, delivered, unique events, duplicates |
+| `GET /received` | Every event id: when it first arrived, attempts, 2xx answers |
+| `DELETE /received` | Forget what was received; the config stays |
+
+`/webhook` is the only POST route: Hookline delivers with POST, so an endpoint aimed at any
+other path can't change the config or records. State is in memory in one process, so run a
+single uvicorn worker.
+
 ## Tests and lint
 
 Tests run against a real Postgres, in a separate `hookline_test` database that is

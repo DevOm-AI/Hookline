@@ -49,7 +49,9 @@ def create_endpoint(
     url = str(body.url)
     try:
         # Localhost receivers are only for local development.
-        ensure_public_url(url, allow_loopback=settings.debug)
+        ensure_public_url(
+            url, allow_loopback=settings.debug, allowed_hosts=settings.allowed_internal_hosts
+        )
     except UnsafeURLError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
