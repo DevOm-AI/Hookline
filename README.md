@@ -120,6 +120,24 @@ slow request outlived the lock and the delivery has since been released, claimed
 worker or settled, that update changes 0 rows and the stale result is dropped, so it never
 overwrites the current owner's. A lock that expired with nobody taking over still counts.
 
+### Graceful shutdown
+
+`docker stop` sends SIGTERM, which starts Celery's warm shutdown: the worker finishes the
+requests it is sending, puts the messages it had prefetched back on the queue, takes no new
+work, and exits. The worker's `stop_grace_period` is 60 seconds, as long as a delivery lock.
+Docker's default of 10 seconds before SIGKILL could cut short a send that is still within
+its timeouts (connecting, writing and reading each get 10 seconds).
+
+A worker killed outright (`kill -9`, out of memory, a lost machine) loses nothing either. Its
+delivery stays `in_progress` until the lock runs out, then the sweeper releases it and it is
+sent again: up to 60 seconds for the lock plus up to 30 until the next sweep. To try it, kill
+the worker while it is sending, then start it again:
+
+```bash
+docker compose kill -s SIGKILL worker
+docker compose start worker
+```
+
 ## At-least-once delivery
 
 Hookline delivers every event **at least once**, not exactly once. Your receiver can get the
